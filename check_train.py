@@ -86,7 +86,7 @@ def test_training_loop(dataloader):
     print("-" * 40)
     
     from config import get_default_config
-    from trainer import FASSMoETrainer
+    from trainer import create_trainer
     
     config = get_default_config()
     config.training.num_epochs = 1
@@ -94,8 +94,8 @@ def test_training_loop(dataloader):
     config.model.hidden_channels = 32
     config.model.num_moe_layers = 2
     
-    # Initialize Trainer
-    trainer = FASSMoETrainer(config, device=device)
+    # Initialize Trainer using create_trainer helper
+    trainer = create_trainer(config, train_loader=dataloader, device=device)
     print("✅ Trainer initialized")
     
     # Run one step manually
