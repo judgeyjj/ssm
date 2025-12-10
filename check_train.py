@@ -104,21 +104,13 @@ def test_training_loop(dataloader):
         lr = lr.to(device)
         hr = hr.to(device)
         
-        # 1. Generator Step
-        g_loss, g_logs = trainer.train_generator_step(lr, hr)
-        print(f"✅ G Step passed | Loss: {g_loss:.4f}")
-        print(f"   Logs: {g_logs}")
+        # Run combined training step (handles both G and D internally)
+        metrics = trainer.train_step(lr, hr)
         
-        # 2. Discriminator Step
-        # Need fake audio from generator first (detached)
-        with torch.no_grad():
-            fake, _ = trainer.generator(lr)
-            
-        d_loss, d_logs = trainer.train_discriminator_step(hr, fake.detach())
-        print(f"✅ D Step passed | Loss: {d_loss:.4f}")
-        print(f"   Logs: {d_logs}")
-        
-        print("✅ Full training step valid")
+        print(f"✅ Training step passed")
+        print(f"   G Loss: {metrics.get('g_loss', 0.0):.4f}")
+        print(f"   D Loss: {metrics.get('d_loss', 0.0):.4f}")
+        print(f"   Full Metrics: {metrics}")
         
     except Exception as e:
         print(f"❌ Training loop failed: {e}")
