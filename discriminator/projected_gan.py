@@ -195,6 +195,10 @@ class ProjectedDiscriminator(nn.Module):
             # Patch embedding
             x = self.vit.patch_embed(x)
             
+            # Handle case where patch_embed returns (B, C, H, W) instead of (B, N, C)
+            if x.dim() == 4:
+                x = x.flatten(2).transpose(1, 2)  # (B, C, H, W) -> (B, C, N) -> (B, N, C)
+            
             # Add class token if present
             if hasattr(self.vit, 'cls_token'):
                 cls_token = self.vit.cls_token.expand(B, -1, -1)
