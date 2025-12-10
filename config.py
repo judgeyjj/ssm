@@ -1,108 +1,89 @@
 """
-Configuration for FASS-MoE Speech Super-Resolution Model.
+Configuration for FASS-MoE Speech Super-Resolution.
 
-Based on paper specifications for audio super-resolution from 16kHz to 48kHz.
+Includes configurations for:
+- Audio processing
+- Model architecture (FASS-MoE)
+- Discriminator
+- Training hyperparameters
 """
 
 from dataclasses import dataclass, field
-from typing import Tuple
+from typing import List, Tuple
 
 
 @dataclass
 class AudioConfig:
     """Audio processing configuration."""
-    input_sample_rate: int = 16000  # Low-resolution input (16kHz)
-    target_sample_rate: int = 48000  # High-resolution target (48kHz)
-    segment_length: int = 8192  # Segment length for high-res audio
-    
-    @property
-    def upsampling_ratio(self) -> int:
-        """Calculate the upsampling ratio."""
-        return self.target_sample_rate // self.input_sample_rate
-    
-    @property
-    def input_segment_length(self) -> int:
-        """Segment length for low-res audio."""
-        return self.segment_length // self.upsampling_ratio
+    input_sr: int = 16000
+    target_sr: int = 48000
+    segment_length: int = 16384  # 增加长度以获得更稳定的梯度，约 0.34s
+    n_fft: int = 1024
+    hop_length: int = 256
+    win_length: int = 1024
+    mel_channels: int = 80
+    fmin: float = 0.0
+    fmax: float = 8000.0  # Nyquist of input
 
 
 @dataclass
 class ModelConfig:
-    """Model architecture configuration."""
-    hidden_channels: int = 64
-    num_moe_layers: int = 4
-    kernel_size: int = 7
+    """
+    FASS-MoE Generator configuration.
     
-    # Mamba block settings
+    Target: ~5M - 8M parameters for SOTA performance.
+    """
+    hidden_channels: int = 96      # 增加通道数 (64 -> 96)
+    num_moe_layers: int = 8        # 增加层数 (4 -> 8)
+    num_experts: int = 8           # 保持专家数量
+    num_experts_per_tok: int = 2   # Top-2 routing
+    kernel_size: int = 7
     mamba_d_state: int = 16
     mamba_d_conv: int = 4
-    mamba_expand: int = 2
-    
-    # MoE (Mixture of Experts) settings
-    num_experts: int = 8
-    num_experts_per_tok: int = 2  # Top-k experts to route
-    
-    # DSG (Dynamic Sparse Gating) settings
-    dsg_threshold: float = 0.1
+    dropout: float = 0.1
 
 
 @dataclass
 class DiscriminatorConfig:
-    """ViT-based Projected GAN discriminator configuration."""
-    patch_size: int = 16
-    embed_dim: int = 384
-    num_heads: int = 6
-    num_layers: int = 4
-    mlp_ratio: float = 4.0
+    """Projected GAN Discriminator configuration."""
+    vit_name: str = "vit_base_patch16_224"  # Uses timm if available
+    pretrained: bool = True
+    img_size: Tuple[int, int] = (224, 224)
+    # Projections from specific ViT layers
+    interp_types: List[str] = field(default_factory=lambda: ["pool", "pool", "pool", "pool"])
+    # Features from layers 3, 6, 9, 12
+    feature_levels: List[int] = field(default_factory=lambda: [3, 6, 9, 12])
 
 
 @dataclass
 class TrainingConfig:
-    """Training loop configuration."""
-    batch_size: int = 32
-    learning_rate: float = 1e-4
+    """Training hyperparameters."""
+    batch_size: int = 16           # 适当减小 Batch Size 以适应更大的模型
+    learning_rate_g: float = 2e-4
+    learning_rate_d: float = 2e-4
     betas: Tuple[float, float] = (0.8, 0.99)
-    weight_decay: float = 0.01
-    
-    # Training duration
-    num_epochs: int = 100
-    steps_per_epoch: int = 1000
-    
-    # Loss weights
-    adversarial_loss_weight: float = 1.0
-    feature_matching_loss_weight: float = 2.0
-    reconstruction_loss_weight: float = 45.0
-    
-    # Scheduler
-    warmup_steps: int = 1000
-    
-    # Checkpointing
-    save_every_n_epochs: int = 5
-    log_every_n_steps: int = 100
+    decay: float = 0.999
+    num_epochs: int = 200          # 增加训练轮数
+    warmup_epochs: int = 5
+    checkpoint_interval: int = 5
+    log_interval: int = 100
+    val_interval: int = 1
+    grad_clip: float = 10.0       # 梯度裁剪
+    lambda_mr_stft: float = 1.0   # Reconstruction loss weight
+    lambda_fm: float = 2.0        # Feature matching weight
+    lambda_adv: float = 0.1       # Adversarial loss weight
+    lambda_aux: float = 1.0       # Load balancing loss weight
 
 
 @dataclass
 class FASSMoEConfig:
-    """Master configuration combining all sub-configs."""
+    """Global configuration wrapper."""
     audio: AudioConfig = field(default_factory=AudioConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
     discriminator: DiscriminatorConfig = field(default_factory=DiscriminatorConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
-    
-    # Paths
-    data_dir: str = "./data"
-    checkpoint_dir: str = "./checkpoints"
-    log_dir: str = "./logs"
-    
-    # Device
-    device: str = "cuda"
-    num_workers: int = 4
-    
-    # Reproducibility
-    seed: int = 42
 
 
 def get_default_config() -> FASSMoEConfig:
-    """Return the default configuration."""
+    """Returns the default configuration."""
     return FASSMoEConfig()
-
