@@ -3,9 +3,11 @@ Dynamic Spectral Gating (DSG) implementation.
 
 Replaces standard Squeeze-and-Excitation with causal context aggregation
 for streaming-compatible channel attention.
+
+修改: 支持 stateful forward，用于 streaming 推理时保持状态连续性。
 """
 
-from typing import Tuple
+from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -18,14 +20,6 @@ from modules.moe import HeterogeneousMoE
 class CausalDSG(nn.Module):
     """
     Causal Dynamic Spectral Gating (DSG) block.
-    
-    Replaces standard Squeeze-and-Excitation with causal context aggregation.
-    Uses CausalConv1d instead of global pooling to maintain causality for streaming.
-    
-    Features:
-    - Causal context aggregation via depth-wise convolution
-    - Channel-wise attention (excitation)
-    - Learnable spectral modulation
     """
     
     def __init__(
@@ -34,22 +28,15 @@ class CausalDSG(nn.Module):
         reduction: int = 4,
         kernel_size: int = 31,
     ):
-        """
-        Args:
-            channels: Number of input/output channels.
-            reduction: Reduction ratio for bottleneck.
-            kernel_size: Kernel size for causal context aggregation.
-        """
         super().__init__()
         self.channels = channels
+        self.kernel_size = kernel_size
         reduced_channels = max(channels // reduction, 8)
         
-        # Causal context aggregation (replaces global pooling)
         self.context_conv = CausalConv1d(
             channels, channels, kernel_size, groups=channels
         )
         
-        # Channel attention with bottleneck
         self.attention = nn.Sequential(
             nn.Linear(channels, reduced_channels),
             nn.ReLU(inplace=True),
@@ -57,7 +44,6 @@ class CausalDSG(nn.Module):
             nn.Sigmoid(),
         )
         
-        # Spectral modulation branch
         self.spectral_gate = nn.Sequential(
             nn.Linear(channels, reduced_channels),
             nn.ReLU(inplace=True),
@@ -65,59 +51,48 @@ class CausalDSG(nn.Module):
             nn.Tanh(),
         )
         
-        # Learnable mixing coefficient
         self.mix_coef = nn.Parameter(torch.zeros(1))
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Apply causal dynamic spectral gating.
-        
-        Args:
-            x: Input tensor of shape (B, C, T) or (B, T, C).
-            
-        Returns:
-            Gated output with same shape as input.
-        """
-        # Detect input format
+        output, _ = self.forward_with_state(x, None)
+        return output
+    
+    def forward_with_state(
+        self, x: torch.Tensor, state: Optional[dict] = None
+    ) -> Tuple[torch.Tensor, dict]:
+        """Forward with state for streaming."""
         input_format = "BCT" if x.dim() == 3 and x.shape[1] == self.channels else "BTC"
         
         if input_format == "BTC":
-            x = x.transpose(1, 2)  # (B, T, C) -> (B, C, T)
+            x = x.transpose(1, 2)
         
         B, C, T = x.shape
         
-        # Causal context aggregation
-        context = self.context_conv(x)  # (B, C, T)
+        # Get buffer
+        if state is None:
+            conv_buffer = None
+        else:
+            conv_buffer = state.get('conv_buffer', None)
         
-        # Transpose for linear layers: (B, C, T) -> (B, T, C)
+        # Causal context aggregation with buffer
+        context, new_conv_buffer = self.context_conv.forward_with_buffer(x, conv_buffer)
+        
         context = context.transpose(1, 2)
-        
-        # Channel attention (excitation)
-        attn = self.attention(context)  # (B, T, C)
-        
-        # Spectral gating
-        spectral = self.spectral_gate(context)  # (B, T, C)
-        
-        # Combine attention and spectral gating with learnable mix
+        attn = self.attention(context)
+        spectral = self.spectral_gate(context)
         gate = attn + torch.sigmoid(self.mix_coef) * spectral
-        
-        # Apply gating
-        gate = gate.transpose(1, 2)  # (B, C, T)
+        gate = gate.transpose(1, 2)
         output = x * gate
         
         if input_format == "BTC":
-            output = output.transpose(1, 2)  # (B, C, T) -> (B, T, C)
+            output = output.transpose(1, 2)
         
-        return output
+        new_state = {'conv_buffer': new_conv_buffer}
+        return output, new_state
 
 
 class DSGModule(nn.Module):
-    """
-    Full DSG module with residual connection and normalization.
-    
-    Wraps CausalDSG with pre-normalization and residual connection
-    for stable training in deep networks.
-    """
+    """Full DSG module with residual connection and normalization."""
     
     def __init__(
         self,
@@ -130,34 +105,30 @@ class DSGModule(nn.Module):
         self.dsg = CausalDSG(channels, reduction, kernel_size)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """
-        Args:
-            x: Input tensor of shape (B, T, C).
-        Returns:
-            Output tensor of shape (B, T, C).
-        """
+        output, _ = self.forward_with_state(x, None)
+        return output
+    
+    def forward_with_state(
+        self, x: torch.Tensor, state: Optional[dict] = None
+    ) -> Tuple[torch.Tensor, dict]:
+        """Forward with state for streaming."""
         residual = x
         x = self.norm(x)
-        x = self.dsg(x)
-        return x + residual
+        x, new_state = self.dsg.forward_with_state(x, state)
+        return x + residual, new_state
 
 
 class FASSMoEBlock(nn.Module):
     """
     Combined FASS-MoE block: MoE + DSG.
     
-    A single transformer-like block combining heterogeneous MoE
-    with causal dynamic spectral gating.
-    
-    Architecture:
-        x -> MoE (with residual) -> DSG (with residual) -> output
+    支持 forward_with_state 用于精确的流式推理。
     """
     
     def __init__(self, config: ModelConfig):
         super().__init__()
         self.config = config
         
-        # Heterogeneous MoE layer
         self.moe = HeterogeneousMoE(
             d_model=config.hidden_channels,
             num_experts=config.num_experts,
@@ -168,7 +139,6 @@ class FASSMoEBlock(nn.Module):
             d_state=config.mamba_d_state,
         )
         
-        # Causal DSG
         self.dsg = DSGModule(
             channels=config.hidden_channels,
             reduction=4,
@@ -176,22 +146,41 @@ class FASSMoEBlock(nn.Module):
         )
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x, aux_loss = self.moe(x)
+        x = self.dsg(x)
+        return x, aux_loss
+    
+    def forward_with_state(
+        self, x: torch.Tensor, state: Optional[dict] = None
+    ) -> Tuple[torch.Tensor, dict, torch.Tensor]:
         """
-        Forward pass through MoE and DSG.
+        Forward with state for streaming.
         
         Args:
-            x: Input tensor of shape (B, T, D).
-            
+            x: Input tensor (B, T, D).
+            state: Dictionary containing:
+                - 'moe': MoE expert states
+                - 'dsg': DSG conv buffer
+                
         Returns:
-            Tuple of (output, aux_loss).
-            - output: Processed tensor (B, T, D)
-            - aux_loss: MoE load balancing loss
+            Tuple of (output, new_state, aux_loss).
         """
-        # MoE layer (includes residual)
-        x, aux_loss = self.moe(x)
+        if state is None:
+            moe_state = None
+            dsg_state = None
+        else:
+            moe_state = state.get('moe', None)
+            dsg_state = state.get('dsg', None)
         
-        # DSG layer (includes residual)
-        x = self.dsg(x)
+        # MoE layer
+        x, new_moe_state, aux_loss = self.moe.forward_with_state(x, moe_state)
         
-        return x, aux_loss
-
+        # DSG layer
+        x, new_dsg_state = self.dsg.forward_with_state(x, dsg_state)
+        
+        new_state = {
+            'moe': new_moe_state,
+            'dsg': new_dsg_state,
+        }
+        
+        return x, new_state, aux_loss

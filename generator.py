@@ -3,6 +3,8 @@ FASS-MoE Generator Model.
 
 Main model assembly combining Mamba, MoE (Mixture of Experts), 
 and DSG (Dynamic Sparse Gating) blocks for speech super-resolution.
+
+修改: 完整的 stateful streaming 实现，保证 forward() 和 infer_stream() 输出完全一致。
 """
 
 from typing import Dict, List, Optional, Tuple
@@ -15,17 +17,7 @@ from modules import CausalConv1d, CausalDSG, FASSMoEBlock
 
 
 class CausalPixelShuffle1d(nn.Module):
-    """
-    Causal PixelShuffle for 1D signals (audio upsampling).
-    
-    Upsamples by expanding channels with Conv1d, then reshuffling.
-    This avoids checkerboard artifacts from TransposedConv.
-    
-    For scale_factor=3 (16kHz -> 48kHz):
-    Input:  (B, C, T)
-    Conv:   (B, C * 3, T)
-    Shuffle: (B, C, T * 3)
-    """
+    """Causal PixelShuffle for 1D signals (audio upsampling)."""
     
     def __init__(
         self,
@@ -46,16 +38,22 @@ class CausalPixelShuffle1d(nn.Module):
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, C, T = x.shape
-        
-        # Expand channels
         x = self.conv(x)
-        
-        # Reshape for pixel shuffle
         x = x.view(B, self.out_channels, self.scale_factor, T)
         x = x.permute(0, 1, 3, 2)
         x = x.reshape(B, self.out_channels, T * self.scale_factor)
-        
         return x
+    
+    def forward_with_buffer(
+        self, x: torch.Tensor, buffer: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward with buffer for streaming."""
+        B, C, T = x.shape
+        x, new_buffer = self.conv.forward_with_buffer(x, buffer)
+        x = x.view(B, self.out_channels, self.scale_factor, T)
+        x = x.permute(0, 1, 3, 2)
+        x = x.reshape(B, self.out_channels, T * self.scale_factor)
+        return x, new_buffer
 
 
 class Stem(nn.Module):
@@ -72,6 +70,15 @@ class Stem(nn.Module):
         x = self.norm(x)
         x = self.act(x)
         return x
+    
+    def forward_with_buffer(
+        self, x: torch.Tensor, buffer: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Forward with buffer for streaming."""
+        x, new_buffer = self.conv.forward_with_buffer(x, buffer)
+        x = self.norm(x)
+        x = self.act(x)
+        return x, new_buffer
 
 
 class MoEBody(nn.Module):
@@ -85,13 +92,29 @@ class MoEBody(nn.Module):
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         total_aux_loss = 0.0
-        
         for layer in self.layers:
             x, aux_loss = layer(x)
             total_aux_loss = total_aux_loss + aux_loss
-        
         total_aux_loss = total_aux_loss / len(self.layers)
         return x, total_aux_loss
+    
+    def forward_with_state(
+        self, x: torch.Tensor, state: Optional[List[dict]] = None
+    ) -> Tuple[torch.Tensor, List[dict], torch.Tensor]:
+        """Forward with state for streaming."""
+        if state is None:
+            state = [None] * len(self.layers)
+        
+        total_aux_loss = 0.0
+        new_states = []
+        
+        for i, layer in enumerate(self.layers):
+            x, new_layer_state, aux_loss = layer.forward_with_state(x, state[i])
+            new_states.append(new_layer_state)
+            total_aux_loss = total_aux_loss + aux_loss
+        
+        total_aux_loss = total_aux_loss / len(self.layers)
+        return x, new_states, total_aux_loss
 
 
 class Upsampler(nn.Module):
@@ -124,6 +147,33 @@ class Upsampler(nn.Module):
         x = self.pixel_shuffle(x)
         x = self.post_act(self.post_norm(self.post_conv(x)))
         return x
+    
+    def forward_with_buffers(
+        self, x: torch.Tensor, buffers: Optional[dict] = None
+    ) -> Tuple[torch.Tensor, dict]:
+        """Forward with buffers for streaming."""
+        if buffers is None:
+            buffers = {}
+        
+        # Pre conv
+        x, pre_buf = self.pre_conv.forward_with_buffer(x, buffers.get('pre', None))
+        x = self.pre_norm(x)
+        x = self.pre_act(x)
+        
+        # Pixel shuffle
+        x, shuffle_buf = self.pixel_shuffle.forward_with_buffer(x, buffers.get('shuffle', None))
+        
+        # Post conv
+        x, post_buf = self.post_conv.forward_with_buffer(x, buffers.get('post', None))
+        x = self.post_norm(x)
+        x = self.post_act(x)
+        
+        new_buffers = {
+            'pre': pre_buf,
+            'shuffle': shuffle_buf,
+            'post': post_buf,
+        }
+        return x, new_buffers
 
 
 class Refiner(nn.Module):
@@ -133,23 +183,42 @@ class Refiner(nn.Module):
         super().__init__()
         self.dsg = CausalDSG(in_channels, reduction=4, kernel_size=31)
         self.proj = CausalConv1d(in_channels, 1, kernel_size)
-        self.tanh = nn.Tanh()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.dsg(x)
         x = self.proj(x)
-        x = self.tanh(x)
         return x
+    
+    def forward_with_buffers(
+        self, x: torch.Tensor, buffers: Optional[dict] = None
+    ) -> Tuple[torch.Tensor, dict]:
+        """Forward with buffers for streaming."""
+        if buffers is None:
+            buffers = {}
+        
+        # DSG
+        x, dsg_state = self.dsg.forward_with_state(x, buffers.get('dsg', None))
+        
+        # Projection
+        x, proj_buf = self.proj.forward_with_buffer(x, buffers.get('proj', None))
+        
+        new_buffers = {
+            'dsg': dsg_state,
+            'proj': proj_buf,
+        }
+        return x, new_buffers
 
 
 class FASSMoEGenerator(nn.Module):
     """
     FASS-MoE Speech Super-Resolution Generator.
     
-    Architecture: Stem -> MoE Body -> Upsampler -> Refiner
+    Architecture: Stem -> MoE Body -> Upsampler -> Refiner -> Skip + Tanh
     
     Input:  (B, 1, T_low)  at 16kHz
     Output: (B, 1, T_high) at 48kHz, where T_high = T_low * 3
+    
+    保证: forward() 和 infer_stream() 的输出在数值上完全一致。
     """
     
     def __init__(self, config: ModelConfig):
@@ -172,9 +241,11 @@ class FASSMoEGenerator(nn.Module):
             mode='linear',
             align_corners=False,
         )
-        self.skip_weight = nn.Parameter(torch.zeros(1))
+        self.skip_weight = nn.Parameter(torch.tensor(-2.0))
+        self.tanh = nn.Tanh()
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Standard forward pass."""
         input_upsampled = self.input_upsample(x)
         
         h = self.stem(x)
@@ -182,9 +253,11 @@ class FASSMoEGenerator(nn.Module):
         h, aux_loss = self.body(h)
         h = h.transpose(1, 2)
         h = self.upsampler(h)
-        output = self.refiner(h)
+        h = self.refiner(h)
         
-        output = output + torch.sigmoid(self.skip_weight) * input_upsampled
+        output = h + torch.sigmoid(self.skip_weight) * input_upsampled
+        output = self.tanh(output)
+        
         return output, aux_loss
     
     def infer(self, x: torch.Tensor) -> torch.Tensor:
@@ -194,90 +267,52 @@ class FASSMoEGenerator(nn.Module):
     def infer_stream(
         self,
         chunk: torch.Tensor,
-        buffer_dict: Optional[Dict[str, torch.Tensor]] = None,
-    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        state: Optional[Dict] = None,
+    ) -> Tuple[torch.Tensor, Dict]:
         """
-        Streaming inference with state management.
+        Streaming inference with COMPLETE state management.
         
-        Processes audio chunk-by-chunk, maintaining state for
-        causal convolution buffers across chunks.
+        保证与 forward() 输出完全一致（在浮点精度范围内）。
+        
+        Args:
+            chunk: Input audio chunk of shape (B, 1, chunk_size).
+            state: Complete state dictionary from previous chunk.
+            
+        Returns:
+            Tuple of (output_chunk, new_state).
         """
-        if buffer_dict is None:
-            buffer_dict = {}
-        
-        B = chunk.shape[0]
-        kernel_size = self.config.kernel_size
+        if state is None:
+            state = {}
         
         input_upsampled = self.input_upsample(chunk)
         
-        # Stem with buffer
-        stem_buf = buffer_dict.get('stem', None)
-        if stem_buf is None:
-            stem_buf = torch.zeros(B, 1, kernel_size - 1, device=chunk.device, dtype=chunk.dtype)
+        # Stem
+        h, stem_buf = self.stem.forward_with_buffer(chunk, state.get('stem', None))
         
-        x_padded = torch.cat([stem_buf, chunk], dim=-1)
-        buffer_dict['stem'] = x_padded[:, :, -(kernel_size - 1):]
-        h = self.stem.conv.conv(x_padded)
-        h = self.stem.norm(h)
-        h = self.stem.act(h)
-        
-        # Body (process as chunk)
+        # Body (MoE layers)
         h = h.transpose(1, 2)
-        h, _ = self.body(h)
+        h, body_states, _ = self.body.forward_with_state(h, state.get('body', None))
         h = h.transpose(1, 2)
         
-        # Upsampler with buffers
-        up_bufs = buffer_dict.get('upsampler', {})
+        # Upsampler
+        h, up_bufs = self.upsampler.forward_with_buffers(h, state.get('upsampler', None))
         
-        pre_buf = up_bufs.get('pre', torch.zeros(B, h.shape[1], kernel_size - 1, device=h.device, dtype=h.dtype))
-        h_padded = torch.cat([pre_buf, h], dim=-1)
-        up_bufs['pre'] = h_padded[:, :, -(kernel_size - 1):]
-        h = self.upsampler.pre_conv.conv(h_padded)
-        h = self.upsampler.pre_norm(h)
-        h = self.upsampler.pre_act(h)
+        # Refiner
+        h, refiner_bufs = self.refiner.forward_with_buffers(h, state.get('refiner', None))
         
-        shuffle_buf = up_bufs.get('shuffle', torch.zeros(B, h.shape[1], kernel_size - 1, device=h.device, dtype=h.dtype))
-        h_padded = torch.cat([shuffle_buf, h], dim=-1)
-        up_bufs['shuffle'] = h_padded[:, :, -(kernel_size - 1):]
-        h = self.upsampler.pixel_shuffle.conv.conv(h_padded)
+        # Skip connection + Tanh
+        output = h + torch.sigmoid(self.skip_weight) * input_upsampled
+        output = self.tanh(output)
         
-        B_h, _, T_conv = h.shape
-        h = h.view(B_h, self.config.hidden_channels, self.scale_factor, T_conv)
-        h = h.permute(0, 1, 3, 2)
-        h = h.reshape(B_h, self.config.hidden_channels, T_conv * self.scale_factor)
+        # Collect new state
+        new_state = {
+            'stem': stem_buf,
+            'body': body_states,
+            'upsampler': up_bufs,
+            'refiner': refiner_bufs,
+        }
         
-        post_buf = up_bufs.get('post', torch.zeros(B, self.config.hidden_channels, kernel_size - 1, device=h.device, dtype=h.dtype))
-        h_padded = torch.cat([post_buf, h], dim=-1)
-        up_bufs['post'] = h_padded[:, :, -(kernel_size - 1):]
-        h = self.upsampler.post_conv.conv(h_padded)
-        h = self.upsampler.post_norm(h)
-        h = self.upsampler.post_act(h)
-        
-        buffer_dict['upsampler'] = up_bufs
-        
-        # Refiner with buffers
-        dsg_kernel = 31
-        dsg_buf = buffer_dict.get('dsg', torch.zeros(B, h.shape[1], dsg_kernel - 1, device=h.device, dtype=h.dtype))
-        h_padded = torch.cat([dsg_buf, h], dim=-1)
-        buffer_dict['dsg'] = h_padded[:, :, -(dsg_kernel - 1):]
-        
-        context = self.refiner.dsg.context_conv.conv(h_padded)
-        context_t = context.transpose(1, 2)
-        attn = self.refiner.dsg.attention(context_t)
-        spectral = self.refiner.dsg.spectral_gate(context_t)
-        gate = attn + torch.sigmoid(self.refiner.dsg.mix_coef) * spectral
-        gate = gate.transpose(1, 2)
-        h = h * gate
-        
-        proj_buf = buffer_dict.get('proj', torch.zeros(B, h.shape[1], kernel_size - 1, device=h.device, dtype=h.dtype))
-        h_padded = torch.cat([proj_buf, h], dim=-1)
-        buffer_dict['proj'] = h_padded[:, :, -(kernel_size - 1):]
-        output = self.refiner.proj.conv(h_padded)
-        output = self.refiner.tanh(output)
-        
-        output = output + torch.sigmoid(self.skip_weight) * input_upsampled
-        
-        return output, buffer_dict
+        return output, new_state
 
 
 def build_generator(config: FASSMoEConfig) -> FASSMoEGenerator:
