@@ -1,13 +1,8 @@
 """
-FASS-MoE Model Components.
-
-This package contains the core building blocks for the FASS-MoE generator:
-- Mamba (Selective State Space Model)
-- MoE (Mixture of Experts)
-- DSG (Dynamic Spectral Gating)
+Model components for FASS-MoE.
 """
 
-from modules.mamba import CausalConv1d, MambaBlock
+from modules.mamba import CausalConv1d, MambaBlock, RMSNorm
 from modules.moe import (
     CausalConvExpert,
     HeterogeneousMoE,
@@ -16,20 +11,24 @@ from modules.moe import (
     compute_spectral_entropy,
 )
 from modules.dsg import CausalDSG, DSGModule, FASSMoEBlock
+from modules.norm import CausalRMSNorm, StreamingGroupNorm
 
 __all__ = [
     # Mamba
-    "CausalConv1d",
-    "MambaBlock",
+    'CausalConv1d',
+    'MambaBlock',
+    'RMSNorm',
     # MoE
-    "CausalConvExpert",
-    "MambaExpert",
-    "HeterogeneousMoERouter",
-    "HeterogeneousMoE",
-    "compute_spectral_entropy",
+    'CausalConvExpert',
+    'MambaExpert',
+    'HeterogeneousMoE',
+    'HeterogeneousMoERouter',
+    'compute_spectral_entropy',
     # DSG
-    "CausalDSG",
-    "DSGModule",
-    "FASSMoEBlock",
+    'CausalDSG',
+    'DSGModule',
+    'FASSMoEBlock',
+    # Norm
+    'CausalRMSNorm',
+    'StreamingGroupNorm',
 ]
-

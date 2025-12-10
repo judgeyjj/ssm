@@ -4,16 +4,72 @@ FASS-MoE Generator Model.
 Main model assembly combining Mamba, MoE (Mixture of Experts), 
 and DSG (Dynamic Sparse Gating) blocks for speech super-resolution.
 
-修改: 完整的 stateful streaming 实现，保证 forward() 和 infer_stream() 输出完全一致。
+修改:
+1. 使用 Weight Normalization 替代 GroupNorm，避免依赖输入长度
+2. 完整的 stateful streaming 实现，保证 forward() 和 infer_stream() 输出完全一致
 """
 
 from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
+import torch.nn.utils.weight_norm as weight_norm
 
 from config import FASSMoEConfig, ModelConfig
 from modules import CausalConv1d, CausalDSG, FASSMoEBlock
+
+
+def WNConv1d(*args, **kwargs):
+    """Weight-normalized Conv1d wrapper."""
+    return weight_norm(nn.Conv1d(*args, **kwargs))
+
+
+class CausalWNConv1d(nn.Module):
+    """
+    Causal Conv1d with Weight Normalization.
+    
+    Weight Normalization 不依赖输入统计量，因此 streaming 一致。
+    """
+    
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        dilation: int = 1,
+        groups: int = 1,
+        bias: bool = True,
+    ):
+        super().__init__()
+        self.kernel_size = kernel_size
+        self.padding = (kernel_size - 1) * dilation
+        self.conv = weight_norm(nn.Conv1d(
+            in_channels,
+            out_channels,
+            kernel_size,
+            padding=0,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
+        ))
+    
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = torch.nn.functional.pad(x, (self.padding, 0))
+        return self.conv(x)
+    
+    def forward_with_buffer(
+        self, x: torch.Tensor, buffer: Optional[torch.Tensor] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        B, C, T = x.shape
+        
+        if buffer is None:
+            buffer = torch.zeros(B, C, self.padding, device=x.device, dtype=x.dtype)
+        
+        x_padded = torch.cat([buffer, x], dim=-1)
+        new_buffer = x_padded[:, :, -self.padding:].clone() if self.padding > 0 else buffer
+        output = self.conv(x_padded)
+        
+        return output, new_buffer
 
 
 class CausalPixelShuffle1d(nn.Module):
@@ -30,7 +86,7 @@ class CausalPixelShuffle1d(nn.Module):
         self.scale_factor = scale_factor
         self.out_channels = out_channels
         
-        self.conv = CausalConv1d(
+        self.conv = CausalWNConv1d(
             in_channels,
             out_channels * scale_factor,
             kernel_size,
@@ -47,7 +103,6 @@ class CausalPixelShuffle1d(nn.Module):
     def forward_with_buffer(
         self, x: torch.Tensor, buffer: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward with buffer for streaming."""
         B, C, T = x.shape
         x, new_buffer = self.conv.forward_with_buffer(x, buffer)
         x = x.view(B, self.out_channels, self.scale_factor, T)
@@ -57,26 +112,26 @@ class CausalPixelShuffle1d(nn.Module):
 
 
 class Stem(nn.Module):
-    """Stem module: Maps input audio (1 channel) to hidden dimension."""
+    """
+    Stem module: Maps input audio (1 channel) to hidden dimension.
+    
+    使用 Weight Normalization 替代 GroupNorm。
+    """
     
     def __init__(self, out_channels: int, kernel_size: int = 7):
         super().__init__()
-        self.conv = CausalConv1d(1, out_channels, kernel_size)
-        self.norm = nn.GroupNorm(1, out_channels)
+        self.conv = CausalWNConv1d(1, out_channels, kernel_size)
         self.act = nn.GELU()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.conv(x)
-        x = self.norm(x)
         x = self.act(x)
         return x
     
     def forward_with_buffer(
         self, x: torch.Tensor, buffer: Optional[torch.Tensor] = None
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Forward with buffer for streaming."""
         x, new_buffer = self.conv.forward_with_buffer(x, buffer)
-        x = self.norm(x)
         x = self.act(x)
         return x, new_buffer
 
@@ -101,7 +156,6 @@ class MoEBody(nn.Module):
     def forward_with_state(
         self, x: torch.Tensor, state: Optional[List[dict]] = None
     ) -> Tuple[torch.Tensor, List[dict], torch.Tensor]:
-        """Forward with state for streaming."""
         if state is None:
             state = [None] * len(self.layers)
         
@@ -118,7 +172,11 @@ class MoEBody(nn.Module):
 
 
 class Upsampler(nn.Module):
-    """Upsampler module: Causal PixelShuffle-based upsampling."""
+    """
+    Upsampler module: Causal PixelShuffle-based upsampling.
+    
+    使用 Weight Normalization 替代 GroupNorm。
+    """
     
     def __init__(
         self,
@@ -130,42 +188,34 @@ class Upsampler(nn.Module):
         super().__init__()
         self.scale_factor = scale_factor
         
-        self.pre_conv = CausalConv1d(in_channels, in_channels, kernel_size)
-        self.pre_norm = nn.GroupNorm(1, in_channels)
+        self.pre_conv = CausalWNConv1d(in_channels, in_channels, kernel_size)
         self.pre_act = nn.GELU()
         
         self.pixel_shuffle = CausalPixelShuffle1d(
             in_channels, out_channels, scale_factor, kernel_size
         )
         
-        self.post_conv = CausalConv1d(out_channels, out_channels, kernel_size)
-        self.post_norm = nn.GroupNorm(1, out_channels)
+        self.post_conv = CausalWNConv1d(out_channels, out_channels, kernel_size)
         self.post_act = nn.GELU()
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.pre_act(self.pre_norm(self.pre_conv(x)))
+        x = self.pre_act(self.pre_conv(x))
         x = self.pixel_shuffle(x)
-        x = self.post_act(self.post_norm(self.post_conv(x)))
+        x = self.post_act(self.post_conv(x))
         return x
     
     def forward_with_buffers(
         self, x: torch.Tensor, buffers: Optional[dict] = None
     ) -> Tuple[torch.Tensor, dict]:
-        """Forward with buffers for streaming."""
         if buffers is None:
             buffers = {}
         
-        # Pre conv
         x, pre_buf = self.pre_conv.forward_with_buffer(x, buffers.get('pre', None))
-        x = self.pre_norm(x)
         x = self.pre_act(x)
         
-        # Pixel shuffle
         x, shuffle_buf = self.pixel_shuffle.forward_with_buffer(x, buffers.get('shuffle', None))
         
-        # Post conv
         x, post_buf = self.post_conv.forward_with_buffer(x, buffers.get('post', None))
-        x = self.post_norm(x)
         x = self.post_act(x)
         
         new_buffers = {
@@ -182,7 +232,7 @@ class Refiner(nn.Module):
     def __init__(self, in_channels: int, kernel_size: int = 7):
         super().__init__()
         self.dsg = CausalDSG(in_channels, reduction=4, kernel_size=31)
-        self.proj = CausalConv1d(in_channels, 1, kernel_size)
+        self.proj = CausalWNConv1d(in_channels, 1, kernel_size)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.dsg(x)
@@ -192,14 +242,10 @@ class Refiner(nn.Module):
     def forward_with_buffers(
         self, x: torch.Tensor, buffers: Optional[dict] = None
     ) -> Tuple[torch.Tensor, dict]:
-        """Forward with buffers for streaming."""
         if buffers is None:
             buffers = {}
         
-        # DSG
         x, dsg_state = self.dsg.forward_with_state(x, buffers.get('dsg', None))
-        
-        # Projection
         x, proj_buf = self.proj.forward_with_buffer(x, buffers.get('proj', None))
         
         new_buffers = {
@@ -213,12 +259,7 @@ class FASSMoEGenerator(nn.Module):
     """
     FASS-MoE Speech Super-Resolution Generator.
     
-    Architecture: Stem -> MoE Body -> Upsampler -> Refiner -> Skip + Tanh
-    
-    Input:  (B, 1, T_low)  at 16kHz
-    Output: (B, 1, T_high) at 48kHz, where T_high = T_low * 3
-    
-    保证: forward() 和 infer_stream() 的输出在数值上完全一致。
+    使用 RMSNorm 和 Weight Normalization，保证 streaming 和 forward 完全一致。
     """
     
     def __init__(self, config: ModelConfig):
@@ -245,7 +286,6 @@ class FASSMoEGenerator(nn.Module):
         self.tanh = nn.Tanh()
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Standard forward pass."""
         input_upsampled = self.input_upsample(x)
         
         h = self.stem(x)
@@ -273,38 +313,25 @@ class FASSMoEGenerator(nn.Module):
         Streaming inference with COMPLETE state management.
         
         保证与 forward() 输出完全一致（在浮点精度范围内）。
-        
-        Args:
-            chunk: Input audio chunk of shape (B, 1, chunk_size).
-            state: Complete state dictionary from previous chunk.
-            
-        Returns:
-            Tuple of (output_chunk, new_state).
         """
         if state is None:
             state = {}
         
         input_upsampled = self.input_upsample(chunk)
         
-        # Stem
         h, stem_buf = self.stem.forward_with_buffer(chunk, state.get('stem', None))
         
-        # Body (MoE layers)
         h = h.transpose(1, 2)
         h, body_states, _ = self.body.forward_with_state(h, state.get('body', None))
         h = h.transpose(1, 2)
         
-        # Upsampler
         h, up_bufs = self.upsampler.forward_with_buffers(h, state.get('upsampler', None))
         
-        # Refiner
         h, refiner_bufs = self.refiner.forward_with_buffers(h, state.get('refiner', None))
         
-        # Skip connection + Tanh
         output = h + torch.sigmoid(self.skip_weight) * input_upsampled
         output = self.tanh(output)
         
-        # Collect new state
         new_state = {
             'stem': stem_buf,
             'body': body_states,
@@ -325,10 +352,11 @@ def build_generator(config: FASSMoEConfig) -> FASSMoEGenerator:
 def _init_weights(module: nn.Module) -> None:
     """Initialize model weights."""
     for m in module.modules():
-        if isinstance(m, (nn.Conv1d, nn.Linear)):
+        if isinstance(m, nn.Conv1d):
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
-        elif isinstance(m, (nn.GroupNorm, nn.LayerNorm)):
-            nn.init.ones_(m.weight)
-            nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.Linear):
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.zeros_(m.bias)

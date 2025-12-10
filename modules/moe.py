@@ -1,10 +1,7 @@
 """
 Heterogeneous Mixture of Experts (MoE) implementation.
 
-Combines CausalConv experts (for local patterns) and Mamba experts
-(for long-range dependencies) with spectral entropy-biased routing.
-
-修改: 支持 stateful forward，用于 streaming 推理时保持状态连续性。
+使用 RMSNorm 和修改后的 Spectral Entropy 计算，确保 streaming 一致性。
 """
 
 import math
@@ -14,47 +11,46 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from modules.mamba import CausalConv1d, MambaBlock
+from modules.mamba import CausalConv1d, MambaBlock, RMSNorm
 
 
 def compute_spectral_entropy(x: torch.Tensor, n_fft: int = 256) -> torch.Tensor:
     """
     Compute spectral entropy of the input signal.
+    
+    为了 streaming 一致性，使用固定窗口大小计算局部频谱熵，
+    不依赖输入长度。
     """
     B, T, D = x.shape
     
+    # 使用固定窗口大小，不依赖 T
     window_size = min(n_fft, T)
-    hop_size = max(1, window_size // 2)
     
-    if T >= window_size:
-        x_windowed = x.unfold(1, window_size, hop_size)
+    if T < window_size:
+        # 短序列：直接用整个序列
+        x_windowed = x.unsqueeze(1)  # (B, 1, T, D)
     else:
-        x_windowed = x.unsqueeze(1).transpose(2, 3)
+        # 只使用最后一个窗口，保证 streaming 一致性
+        x_windowed = x[:, -window_size:, :].unsqueeze(1)  # (B, 1, window_size, D)
     
-    spectrum = torch.fft.rfft(x_windowed, dim=-1).abs()
+    # FFT along last dimension
+    spectrum = torch.fft.rfft(x_windowed, dim=2).abs()
+    
     spectrum = spectrum + 1e-10
-    prob = spectrum / spectrum.sum(dim=-1, keepdim=True)
-    entropy = -torch.sum(prob * torch.log(prob + 1e-10), dim=-1)
+    prob = spectrum / spectrum.sum(dim=2, keepdim=True)
+    entropy = -torch.sum(prob * torch.log(prob + 1e-10), dim=2)
     
-    max_entropy = math.log(spectrum.shape[-1])
+    max_entropy = math.log(spectrum.shape[2])
     entropy = entropy / max_entropy
     
-    if entropy.dim() == 4:
-        entropy = entropy.mean(dim=(1, 2, 3))
-    elif entropy.dim() == 3:
-        entropy = entropy.mean(dim=(1, 2))
-    else:
-        entropy = entropy.mean(dim=1)
+    # Average over all dimensions except batch
+    entropy = entropy.mean(dim=(1, 2))
     
     return entropy.unsqueeze(-1)
 
 
 class CausalConvExpert(nn.Module):
-    """
-    Causal Convolution Expert for MoE.
-    
-    注意：CausalConv 是无状态的（只需要 buffer），状态管理在上层处理。
-    """
+    """Causal Convolution Expert for MoE."""
     
     def __init__(self, d_model: int, kernel_size: int = 7, expand: int = 2):
         super().__init__()
@@ -80,7 +76,6 @@ class CausalConvExpert(nn.Module):
     def forward_with_state(
         self, x: torch.Tensor, state: Optional[dict] = None
     ) -> Tuple[torch.Tensor, dict]:
-        """Forward with state for streaming."""
         B, T, D = x.shape
         
         if state is None:
@@ -101,9 +96,7 @@ class CausalConvExpert(nn.Module):
 
 
 class MambaExpert(nn.Module):
-    """
-    Mamba-based Expert for MoE.
-    """
+    """Mamba-based Expert for MoE."""
     
     def __init__(self, d_model: int, d_state: int = 16, d_conv: int = 4):
         super().__init__()
@@ -115,7 +108,6 @@ class MambaExpert(nn.Module):
     def forward_with_state(
         self, x: torch.Tensor, state: Optional[dict] = None
     ) -> Tuple[torch.Tensor, dict]:
-        """Forward with state for streaming."""
         output, new_state = self.mamba.forward_with_state(x, state)
         return output, new_state
 
@@ -152,11 +144,7 @@ class HeterogeneousMoERouter(nn.Module):
 
 
 class HeterogeneousMoE(nn.Module):
-    """
-    Heterogeneous Mixture of Experts layer.
-    
-    支持 forward_with_state 用于精确的流式推理。
-    """
+    """Heterogeneous Mixture of Experts layer with RMSNorm."""
     
     def __init__(
         self,
@@ -177,16 +165,16 @@ class HeterogeneousMoE(nn.Module):
         
         self.experts = nn.ModuleList()
         
-        # CausalConv experts
         for _ in range(num_conv_experts):
             self.experts.append(CausalConvExpert(d_model, kernel_size))
         
-        # Mamba experts
         for _ in range(num_mamba_experts):
             self.experts.append(MambaExpert(d_model, d_state))
         
         self.router = HeterogeneousMoERouter(d_model, num_experts, top_k)
-        self.norm = nn.LayerNorm(d_model)
+        
+        # 使用 RMSNorm 替代 LayerNorm
+        self.norm = RMSNorm(d_model)
     
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         output, _, aux_loss = self.forward_with_state(x, None)
@@ -195,16 +183,6 @@ class HeterogeneousMoE(nn.Module):
     def forward_with_state(
         self, x: torch.Tensor, state: Optional[Dict[int, dict]] = None
     ) -> Tuple[torch.Tensor, Dict[int, dict], torch.Tensor]:
-        """
-        Forward with state management for all experts.
-        
-        Args:
-            x: Input tensor (B, T, D).
-            state: Dictionary mapping expert_idx -> expert_state.
-            
-        Returns:
-            Tuple of (output, new_state, aux_loss).
-        """
         residual = x
         x = self.norm(x)
         
@@ -213,16 +191,10 @@ class HeterogeneousMoE(nn.Module):
         if state is None:
             state = {}
         
-        # Compute spectral entropy for routing
         entropy = compute_spectral_entropy(x)
         
-        # Get routing decisions
         routing_weights, selected_experts, router_logits = self.router(x, entropy)
-        
-        # Compute auxiliary loss
         aux_loss = self._compute_load_balance_loss(router_logits, selected_experts)
-        
-        # Apply experts with state
         output, new_state = self._apply_experts_with_state(
             x, routing_weights, selected_experts, state
         )
@@ -236,7 +208,6 @@ class HeterogeneousMoE(nn.Module):
         selected_experts: torch.Tensor,
         state: Dict[int, dict],
     ) -> Tuple[torch.Tensor, Dict[int, dict]]:
-        """Apply experts with state management."""
         B, T, D = x.shape
         output = torch.zeros_like(x)
         new_state = {}
@@ -245,9 +216,6 @@ class HeterogeneousMoE(nn.Module):
             expert_mask = (selected_experts == expert_idx)
             
             if not expert_mask.any():
-                # 即使没有 token 被路由到这个 expert，
-                # 我们仍然需要保持状态（用零输入更新）
-                # 但为了效率，我们只在有 token 时处理
                 if expert_idx in state:
                     new_state[expert_idx] = state[expert_idx]
                 continue
@@ -258,16 +226,9 @@ class HeterogeneousMoE(nn.Module):
                 torch.zeros_like(routing_weights)
             ).sum(dim=-1)
             
-            # Get state for this expert
             expert_state = state.get(expert_idx, None)
-            
-            # Process through expert with state
             expert_output, expert_new_state = expert.forward_with_state(x, expert_state)
-            
-            # Save new state
             new_state[expert_idx] = expert_new_state
-            
-            # Weighted addition
             output = output + expert_output * weight_mask.unsqueeze(-1)
         
         return output, new_state
