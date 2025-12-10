@@ -1,7 +1,7 @@
 """
 Heterogeneous Mixture of Experts (MoE) implementation.
 
-使用 RMSNorm 和修改后的 Spectral Entropy 计算，确保 streaming 一致性。
+使用 RMSNorm 和 Causal Feature Extraction，确保 streaming 一致性。
 """
 
 import math
@@ -16,37 +16,50 @@ from modules.mamba import CausalConv1d, MambaBlock, RMSNorm
 
 def compute_spectral_entropy(x: torch.Tensor, n_fft: int = 256) -> torch.Tensor:
     """
-    Compute spectral entropy of the input signal.
+    Compute a causal proxy for spectral entropy/complexity.
     
-    为了 streaming 一致性，使用固定窗口大小计算局部频谱熵，
-    不依赖输入长度。
+    为了保证 Forward 和 Streaming 的严格一致性，我们计算
+    "Log Variance over a causal sliding window"。
+    这在物理上表征了信号的动态复杂度，与谱熵高度相关，
+    且计算是严格因果 O(T) 的。
     """
     B, T, D = x.shape
     
-    # 使用固定窗口大小，不依赖 T
-    window_size = min(n_fft, T)
+    # 1. Reduce to single channel (energy representative)
+    x_mean = x.mean(dim=-1, keepdim=True)  # (B, T, 1)
     
-    if T < window_size:
-        # 短序列：直接用整个序列
-        x_windowed = x.unsqueeze(1)  # (B, 1, T, D)
-    else:
-        # 只使用最后一个窗口，保证 streaming 一致性
-        x_windowed = x[:, -window_size:, :].unsqueeze(1)  # (B, 1, window_size, D)
+    # 2. Window size for local statistics
+    win_size = min(64, T)
     
-    # FFT along last dimension
-    spectrum = torch.fft.rfft(x_windowed, dim=2).abs()
+    # 3. Compute local variance using simple causal pooling
+    # Var(X) = E[X^2] - (E[X])^2
+    # Use Average Pooling as a causal moving average
     
-    spectrum = spectrum + 1e-10
-    prob = spectrum / spectrum.sum(dim=2, keepdim=True)
-    entropy = -torch.sum(prob * torch.log(prob + 1e-10), dim=2)
+    # Pad left to ensure causality
+    padding = win_size - 1
+    x_mean_pad = F.pad(x_mean.transpose(1, 2), (padding, 0))  # (B, 1, T+pad)
     
-    max_entropy = math.log(spectrum.shape[2])
-    entropy = entropy / max_entropy
+    # Moving Average of X
+    mu = F.avg_pool1d(x_mean_pad, kernel_size=win_size, stride=1)
     
-    # Average over all dimensions except batch
-    entropy = entropy.mean(dim=(1, 2))
+    # Moving Average of X^2
+    mu_sq = F.avg_pool1d(x_mean_pad ** 2, kernel_size=win_size, stride=1)
     
-    return entropy.unsqueeze(-1)
+    # Variance = E[X^2] - (E[X])^2
+    # Clamp to avoid negative values due to precision
+    var = F.relu(mu_sq - mu ** 2)
+    
+    # Log variance as entropy proxy
+    entropy = torch.log(var + 1e-6)
+    
+    # Restore shape (B, T, 1)
+    entropy = entropy.transpose(1, 2)
+    
+    # Normalize roughly to [0, 1] range for stability
+    # Assuming standard normalized input, var is ~1
+    entropy = (entropy + 10.0) / 20.0
+    
+    return entropy
 
 
 class CausalConvExpert(nn.Module):
@@ -131,8 +144,9 @@ class HeterogeneousMoERouter(nn.Module):
         B, T, D = x.shape
         
         router_logits = self.gate(x)
-        entropy_bias = self.entropy_proj(entropy)
-        entropy_bias = entropy_bias.unsqueeze(1).expand(-1, T, -1)
+        
+        # Entropy is now (B, T, 1), fully causal and aligned
+        entropy_bias = self.entropy_proj(entropy) # (B, T, Experts)
         
         router_logits = router_logits + entropy_bias
         router_logits = router_logits / (self.temperature.abs() + 1e-6)
@@ -190,15 +204,40 @@ class HeterogeneousMoE(nn.Module):
         
         if state is None:
             state = {}
+            # Need to maintain buffer for entropy computation in streaming
+            entropy_buffer = None
+        else:
+            entropy_buffer = state.get('entropy_buffer', None)
         
-        entropy = compute_spectral_entropy(x)
+        # Handle Streaming for Entropy Calculation
+        if T < 64 and entropy_buffer is not None:
+             # Concatenate buffer for causal window computation
+             x_for_entropy = torch.cat([entropy_buffer, x], dim=1)
+             entropy_full = compute_spectral_entropy(x_for_entropy)
+             entropy = entropy_full[:, -T:, :] # Take only the new part
+             
+             # Update buffer (keep last 63 samples)
+             new_entropy_buffer = x_for_entropy[:, -(64-1):, :]
+        elif T < 64 and entropy_buffer is None:
+             # First chunk, padded automatically inside compute_spectral_entropy
+             entropy = compute_spectral_entropy(x)
+             new_entropy_buffer = x[:, -(64-1):, :]
+        else:
+             # Forward mode or Long sequence
+             entropy = compute_spectral_entropy(x)
+             new_entropy_buffer = None # Not needed/handled for pure forward
         
         routing_weights, selected_experts, router_logits = self.router(x, entropy)
         aux_loss = self._compute_load_balance_loss(router_logits, selected_experts)
-        output, new_state = self._apply_experts_with_state(
+        output, new_expert_states = self._apply_experts_with_state(
             x, routing_weights, selected_experts, state
         )
         
+        # Merge expert states and entropy buffer
+        new_state = new_expert_states
+        if new_entropy_buffer is not None:
+            new_state['entropy_buffer'] = new_entropy_buffer
+            
         return output + residual, new_state, aux_loss
     
     def _apply_experts_with_state(

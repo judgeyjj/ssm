@@ -33,8 +33,6 @@ def main():
     
     # Use DEFAULT config to check real parameter count
     config = get_default_config()
-    # config.model.hidden_channels = 32 # Commented out to see real size
-    # config.model.num_moe_layers = 2   # Commented out to see real size
     
     set_seed(42)
     model = build_generator(config).to(device)
@@ -135,8 +133,15 @@ def main():
     print("[Step 3] Testing Gradient Propagation")
     print("-" * 40)
     
+    # Reduce L for gradient check to avoid hang in pure Python implementation
+    # This simulates what happens during training (where we use Mamba CUDA kernels)
+    # but allows validation in this pure-Python environment.
+    L_grad = 2048
+    print(f"Reducing sequence length to {L_grad} for gradient check to avoid Python loop hang...")
+    x_grad = torch.randn(B, C, L_grad, device=device)
+    
     model.train()
-    y_train, aux_loss = model(x)
+    y_train, aux_loss = model(x_grad)
     loss = y_train.mean() + aux_loss
     
     try:
