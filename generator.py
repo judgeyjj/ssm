@@ -262,10 +262,10 @@ class FASSMoEGenerator(nn.Module):
     使用 RMSNorm 和 Weight Normalization，保证 streaming 和 forward 完全一致。
     """
     
-    def __init__(self, config: ModelConfig):
+    def __init__(self, config: ModelConfig, scale_factor: int = 3):
         super().__init__()
         self.config = config
-        self.scale_factor = 3
+        self.scale_factor = scale_factor
         
         self.stem = Stem(config.hidden_channels, config.kernel_size)
         self.body = MoEBody(config, config.num_moe_layers)
@@ -344,7 +344,15 @@ class FASSMoEGenerator(nn.Module):
 
 def build_generator(config: FASSMoEConfig) -> FASSMoEGenerator:
     """Build and initialize the FASS-MoE generator."""
-    model = FASSMoEGenerator(config.model)
+    # Validate and calculate scale factor
+    if config.audio.target_sr % config.audio.input_sr != 0:
+        raise ValueError(
+            f"Target sample rate ({config.audio.target_sr}) must be a multiple "
+            f"of input sample rate ({config.audio.input_sr})"
+        )
+    scale_factor = config.audio.target_sr // config.audio.input_sr
+
+    model = FASSMoEGenerator(config.model, scale_factor=scale_factor)
     _init_weights(model)
     return model
 

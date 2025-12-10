@@ -39,46 +39,53 @@ class FASSMoETrainer:
         discriminator: ProjectedDiscriminator,
         train_loader: DataLoader,
         val_loader: Optional[DataLoader] = None,
+        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        checkpoint_dir: str = "checkpoints",
     ):
         self.config = config
         self.generator = generator
         self.discriminator = discriminator
         self.train_loader = train_loader
         self.val_loader = val_loader
-        self.device = config.device
+        self.device = device
+        self.checkpoint_dir = Path(checkpoint_dir)
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         
         # Move models to device
         self.generator = self.generator.to(self.device)
         self.discriminator = self.discriminator.to(self.device)
         
         # Optimizers (AdamW)
+        # Weight decay defaulting to 0.01 if not specified, though config doesn't have it currently
+        weight_decay = 0.01 
+        
         self.optimizer_g = AdamW(
             self.generator.parameters(),
-            lr=config.training.learning_rate,
+            lr=config.training.learning_rate_g,
             betas=config.training.betas,
-            weight_decay=config.training.weight_decay,
+            weight_decay=weight_decay,
         )
         
         trainable_d_params = [p for p in self.discriminator.parameters() if p.requires_grad]
         self.optimizer_d = AdamW(
             trainable_d_params,
-            lr=config.training.learning_rate,
+            lr=config.training.learning_rate_d,
             betas=config.training.betas,
-            weight_decay=config.training.weight_decay,
+            weight_decay=weight_decay,
         )
         
         self._setup_schedulers()
         
         # Loss functions
-        self.mr_stft_loss = MultiResolutionSTFTLoss()
-        self.feature_matching_loss = FeatureMatchingLoss()
-        self.hinge_loss = HingeLoss()
+        self.mr_stft_loss = MultiResolutionSTFTLoss().to(self.device)
+        self.feature_matching_loss = FeatureMatchingLoss().to(self.device)
+        self.hinge_loss = HingeLoss().to(self.device)
         
         # Loss weights
-        self.lambda_adv = config.training.adversarial_loss_weight
-        self.lambda_fm = config.training.feature_matching_loss_weight
-        self.lambda_recon = config.training.reconstruction_loss_weight
-        self.lambda_aux = 0.01
+        self.lambda_adv = config.training.lambda_adv
+        self.lambda_fm = config.training.lambda_fm
+        self.lambda_recon = config.training.lambda_mr_stft
+        self.lambda_aux = config.training.lambda_aux
         
         # Training state
         self.current_epoch = 0
@@ -87,14 +94,18 @@ class FASSMoETrainer:
     
     def _setup_schedulers(self):
         """Setup learning rate schedulers with warmup."""
-        warmup_steps = self.config.training.warmup_steps
-        total_steps = self.config.training.num_epochs * self.config.training.steps_per_epoch
+        steps_per_epoch = len(self.train_loader)
+        warmup_steps = self.config.training.warmup_epochs * steps_per_epoch
+        total_steps = self.config.training.num_epochs * steps_per_epoch
         
         warmup_g = LinearLR(self.optimizer_g, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
         warmup_d = LinearLR(self.optimizer_d, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
         
-        cosine_g = CosineAnnealingLR(self.optimizer_g, T_max=total_steps - warmup_steps, eta_min=1e-6)
-        cosine_d = CosineAnnealingLR(self.optimizer_d, T_max=total_steps - warmup_steps, eta_min=1e-6)
+        # Avoid negative or zero duration for cosine
+        cosine_steps = max(1, total_steps - warmup_steps)
+        
+        cosine_g = CosineAnnealingLR(self.optimizer_g, T_max=cosine_steps, eta_min=1e-6)
+        cosine_d = CosineAnnealingLR(self.optimizer_d, T_max=cosine_steps, eta_min=1e-6)
         
         self.scheduler_g = SequentialLR(self.optimizer_g, [warmup_g, cosine_g], milestones=[warmup_steps])
         self.scheduler_d = SequentialLR(self.optimizer_d, [warmup_d, cosine_d], milestones=[warmup_steps])
@@ -109,16 +120,16 @@ class FASSMoETrainer:
             train_metrics = self.train_epoch(epoch)
             self._log_metrics(train_metrics, "train", epoch)
             
-            if self.val_loader is not None:
+            if self.val_loader is not None and (epoch + 1) % self.config.training.val_interval == 0:
                 val_metrics = self.validate()
                 self._log_metrics(val_metrics, "val", epoch)
                 
                 if val_metrics['total_loss'] < self.best_val_loss:
                     self.best_val_loss = val_metrics['total_loss']
-                    self.save_checkpoint(Path(self.config.checkpoint_dir) / "best_model.pt")
+                    self.save_checkpoint(self.checkpoint_dir / "best_model.pt")
             
-            if (epoch + 1) % self.config.training.save_every_n_epochs == 0:
-                self.save_checkpoint(Path(self.config.checkpoint_dir) / f"checkpoint_epoch_{epoch+1}.pt")
+            if (epoch + 1) % self.config.training.checkpoint_interval == 0:
+                self.save_checkpoint(self.checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pt")
         
         print("Training complete!")
     
@@ -145,12 +156,9 @@ class FASSMoETrainer:
             self.scheduler_d.step()
             self.global_step += 1
             
-            if (batch_idx + 1) % self.config.training.log_every_n_steps == 0:
+            if (batch_idx + 1) % self.config.training.log_interval == 0:
                 print(f"Epoch {epoch+1} [{batch_idx+1}/{len(self.train_loader)}] G: {step_metrics['g_loss']:.4f} D: {step_metrics['d_loss']:.4f}")
             
-            if batch_idx >= self.config.training.steps_per_epoch - 1:
-                break
-        
         for key in epoch_metrics:
             epoch_metrics[key] /= max(num_batches, 1)
         
@@ -171,7 +179,7 @@ class FASSMoETrainer:
         
         d_loss = self.hinge_loss.discriminator_loss(real_logits, fake_logits)
         d_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.config.training.grad_clip)
         self.optimizer_d.step()
         
         metrics['d_loss'] = d_loss.item()
@@ -196,7 +204,7 @@ class FASSMoETrainer:
         )
         
         g_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.config.training.grad_clip)
         self.optimizer_g.step()
         
         metrics['g_loss'] = g_loss.item()
@@ -290,6 +298,8 @@ def create_trainer(
     config: FASSMoEConfig,
     train_loader: DataLoader,
     val_loader: Optional[DataLoader] = None,
+    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    checkpoint_dir: str = "checkpoints",
 ) -> FASSMoETrainer:
     """Create a trainer with generator and discriminator."""
     generator = build_generator(config)
@@ -301,4 +311,6 @@ def create_trainer(
         discriminator=discriminator,
         train_loader=train_loader,
         val_loader=val_loader,
+        device=device,
+        checkpoint_dir=checkpoint_dir,
     )

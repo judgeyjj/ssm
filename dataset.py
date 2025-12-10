@@ -144,15 +144,15 @@ class SSRDataset(Dataset):
         # Applied before downsampling to prevent aliasing
         self.lowpass_filter = LowPassFilter(
             cutoff_freq=8000,  # 8kHz cutoff
-            sample_rate=config.target_sample_rate,
+            sample_rate=config.target_sr,
             kernel_size=101,
         )
         
         # High-quality Sinc resampler for downsampling
         # Using kaiser_best for highest quality interpolation
         self.resampler = torchaudio.transforms.Resample(
-            orig_freq=config.target_sample_rate,
-            new_freq=config.input_sample_rate,
+            orig_freq=config.target_sr,
+            new_freq=config.input_sr,
             resampling_method="sinc_interp_kaiser",
             lowpass_filter_width=64,
             rolloff=0.9475937167399596,
@@ -187,7 +187,7 @@ class SSRDataset(Dataset):
         high_res_audio, sample_rate = self._load_audio(audio_path)
         
         # Resample to target sample rate if needed
-        if sample_rate != self.config.target_sample_rate:
+        if sample_rate != self.config.target_sr:
             high_res_audio = self._resample_to_target(high_res_audio, sample_rate)
         
         # Random crop (training) or center crop (validation) to segment length
@@ -236,7 +236,7 @@ class SSRDataset(Dataset):
         """
         resampler = torchaudio.transforms.Resample(
             orig_freq=orig_sr,
-            new_freq=self.config.target_sample_rate,
+            new_freq=self.config.target_sr,
             resampling_method="sinc_interp_kaiser",
         )
         return resampler(audio)

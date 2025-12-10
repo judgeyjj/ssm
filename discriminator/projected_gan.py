@@ -104,6 +104,9 @@ class ProjectedDiscriminator(nn.Module):
         self,
         config: DiscriminatorConfig,
         sample_rate: int = 48000,
+        n_fft: int = 1024,
+        hop_length: int = 256,
+        n_mels: int = 80,
         vit_model: str = 'vit_base_patch16_224',
         feature_layers: List[int] = None,
         proj_channels: int = 64,
@@ -112,6 +115,9 @@ class ProjectedDiscriminator(nn.Module):
         Args:
             config: Discriminator configuration.
             sample_rate: Audio sample rate.
+            n_fft: FFT window size for MelSpectrogram.
+            hop_length: Hop length for MelSpectrogram.
+            n_mels: Number of mel filterbanks.
             vit_model: Name of ViT model to load from timm.
             feature_layers: Which ViT layers to extract features from.
             proj_channels: Number of channels for projection heads.
@@ -121,11 +127,14 @@ class ProjectedDiscriminator(nn.Module):
         self.feature_layers = feature_layers or [3, 6, 9, 12]
         
         # Mel-spectrogram transform
+        # Note: We use the passed n_mels (usually 80 or 128) and interpolate to 224 later
+        # OR we can compute 224 mels directly. The original paper often interpolates.
+        # Here we compute the audio-specific mel first.
         self.mel_transform = MelSpectrogram(
             sample_rate=sample_rate,
-            n_fft=1024,
-            hop_length=256,
-            n_mels=224,  # Match ViT input size
+            n_fft=n_fft,
+            hop_length=hop_length,
+            n_mels=n_mels,
         )
         
         # Load ViT backbone
@@ -160,10 +169,10 @@ class ProjectedDiscriminator(nn.Module):
             print("Warning: timm not installed, using SimpleViT fallback")
             return SimpleViT(
                 image_size=224,
-                patch_size=self.config.patch_size,
-                dim=self.config.embed_dim,
+                patch_size=16, # Default for base_patch16
+                dim=768,       # Default for base
                 depth=12,
-                heads=self.config.num_heads,
+                heads=12,
             )
     
     def _extract_vit_features(self, x: torch.Tensor) -> List[torch.Tensor]:
@@ -301,6 +310,10 @@ def build_discriminator(config: FASSMoEConfig) -> ProjectedDiscriminator:
     """
     return ProjectedDiscriminator(
         config=config.discriminator,
-        sample_rate=config.audio.target_sample_rate,
+        sample_rate=config.audio.target_sr,
+        n_fft=config.audio.n_fft,
+        hop_length=config.audio.hop_length,
+        n_mels=config.audio.mel_channels,
+        vit_model=config.discriminator.vit_name,
+        feature_layers=config.discriminator.feature_levels,
     )
-

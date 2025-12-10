@@ -17,7 +17,9 @@ class AudioConfig:
     """Audio processing configuration."""
     input_sr: int = 16000
     target_sr: int = 48000
-    segment_length: int = 16384  # 增加长度以获得更稳定的梯度，约 0.34s
+    # Important: segment_length must be divisible by (target_sr / input_sr)
+    # 16200 / (48000/16000) = 16200 / 3 = 5400 (Integer)
+    segment_length: int = 16200 
     n_fft: int = 1024
     hop_length: int = 256
     win_length: int = 1024
