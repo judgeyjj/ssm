@@ -34,7 +34,8 @@ def create_dummy_dataset(root_dir: Path, num_files: int = 10, duration_sec: floa
         wav = wav.unsqueeze(0)  # (1, T)
         
         path = root_dir / f"test_audio_{i:03d}.wav"
-        torchaudio.save(path, wav, sr)
+        # Convert Path to str for compatibility with older torchaudio versions
+        torchaudio.save(str(path), wav, sr)
     print(f"✅ Created {num_files} dummy audio files in {root_dir}")
 
 
