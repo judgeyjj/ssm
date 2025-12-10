@@ -67,6 +67,7 @@ class TrainingConfig:
     decay: float = 0.999
     num_epochs: int = 200          # 增加训练轮数
     warmup_epochs: int = 5
+    num_workers: int = 4           # Data loader workers
     checkpoint_interval: int = 5
     log_interval: int = 100
     val_interval: int = 1

@@ -368,7 +368,7 @@ def create_dataloader(
         dataset,
         batch_size=config.training.batch_size,
         shuffle=train,
-        num_workers=config.num_workers,
+        num_workers=config.training.num_workers,
         pin_memory=True,
         drop_last=train,
     )
