@@ -213,7 +213,8 @@ class SSRDataset(Dataset):
             Tuple of (audio_tensor, sample_rate).
             Audio tensor has shape (1, T).
         """
-        waveform, sample_rate = torchaudio.load(path)
+        # Convert Path to str for compatibility with older torchaudio versions
+        waveform, sample_rate = torchaudio.load(str(path))
         
         # Convert to mono by averaging channels if stereo
         if waveform.shape[0] > 1:
