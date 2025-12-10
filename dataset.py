@@ -333,14 +333,21 @@ def find_audio_files(
     data_dir = Path(data_dir)
     audio_files = []
     
+    if not data_dir.exists():
+        print(f"Warning: Directory {data_dir} does not exist.")
+        return []
+    
     for ext in extensions:
+        # Recursive glob search
         audio_files.extend(data_dir.rglob(f"*{ext}"))
     
+    # Sort for deterministic order
     return sorted(audio_files)
 
 
 def create_dataloader(
     config: FASSMoEConfig,
+    data_dir: Optional[str] = None,
     audio_paths: Optional[List[Union[str, Path]]] = None,
     train: bool = True,
 ) -> DataLoader:
@@ -349,15 +356,18 @@ def create_dataloader(
     
     Args:
         config: Full FASS-MoE configuration.
-        audio_paths: List of paths to high-resolution audio files.
-                    If None, will search config.data_dir for audio files.
+        data_dir: Directory to search for audio files (if audio_paths is None).
+        audio_paths: Specific list of audio paths (overrides data_dir).
         train: Whether this is for training.
         
     Returns:
         Configured DataLoader instance.
     """
     if audio_paths is None:
-        audio_paths = find_audio_files(config.data_dir)
+        if data_dir is None:
+            raise ValueError("Must provide either data_dir or audio_paths")
+        audio_paths = find_audio_files(data_dir)
+        print(f"Found {len(audio_paths)} audio files in {data_dir}")
     
     dataset = SSRDataset(
         audio_paths=audio_paths,
@@ -377,31 +387,28 @@ def create_dataloader(
     return dataloader
 
 
-def create_train_val_dataloaders(
-    config: FASSMoEConfig,
-    val_split: float = 0.1,
-) -> Tuple[DataLoader, DataLoader]:
+def create_dataloaders(config: FASSMoEConfig) -> Tuple[DataLoader, DataLoader]:
     """
-    Create train and validation DataLoaders with a random split.
+    Create train and validation DataLoaders using paths from config.
     
     Args:
         config: Full FASS-MoE configuration.
-        val_split: Fraction of data to use for validation.
         
     Returns:
         Tuple of (train_loader, val_loader).
     """
-    all_paths = find_audio_files(config.data_dir)
+    print(f"Loading training data from: {config.data.train_dir}")
+    train_loader = create_dataloader(
+        config, 
+        data_dir=config.data.train_dir, 
+        train=True
+    )
     
-    # Random shuffle for split
-    import random
-    random.shuffle(all_paths)
-    
-    split_idx = int(len(all_paths) * (1 - val_split))
-    train_paths = all_paths[:split_idx]
-    val_paths = all_paths[split_idx:]
-    
-    train_loader = create_dataloader(config, train_paths, train=True)
-    val_loader = create_dataloader(config, val_paths, train=False)
+    print(f"Loading validation data from: {config.data.val_dir}")
+    val_loader = create_dataloader(
+        config, 
+        data_dir=config.data.val_dir, 
+        train=False
+    )
     
     return train_loader, val_loader
