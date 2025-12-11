@@ -1,5 +1,5 @@
 """
-SOTA Discriminator components.
+Discriminator components.
 """
 
 from discriminator.hifi import HiFiDiscriminator

@@ -1,7 +1,7 @@
 """
-Training loop for FASS-MoE Speech Super-Resolution (SOTA HiFi-GAN style).
-Supports Generator Warmup, DistributedDataParallel, Tqdm, and SwanLab logging.
-Note: TF32 is enabled by default on Ampere GPUs (A40) for automatic speedup.
+Training loop for FASS-MoE Speech Super-Resolution (HiFi-GAN style).
+Supports Generator Warmup, DistributedDataParallel, Tqdm, SwanLab logging,
+LSD/Si-SNR metrics, and Audio Validation.
 """
 
 import os
@@ -10,6 +10,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+import torchaudio
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
@@ -25,12 +26,13 @@ except ImportError:
 from config import FASSMoEConfig
 from discriminator import build_discriminator, HiFiDiscriminator
 from generator import FASSMoEGenerator, build_generator
-from losses import CombinedGeneratorLoss, LSGANLoss
+from losses import CombinedGeneratorLoss, DiscriminatorLoss
+from metrics import compute_lsd, compute_sisnr
 
 
 class FASSMoETrainer:
     """
-    Trainer for FASS-MoE model with SOTA HiFi-GAN Discriminator.
+    Trainer for FASS-MoE model with HiFi-GAN Discriminator.
     """
     
     def __init__(
@@ -53,6 +55,7 @@ class FASSMoETrainer:
         self.val_loader = val_loader
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
+        self.samples_dir = self.checkpoint_dir / "samples"
         self.distributed = distributed
         self.local_rank = local_rank
         self.enable_logging = enable_logging
@@ -62,7 +65,17 @@ class FASSMoETrainer:
         
         if self.is_main_process:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            # Note: SwanLab is initialized in train.py, not here to avoid duplicate init
+            self.samples_dir.mkdir(parents=True, exist_ok=True)
+            if self.enable_logging and HAS_SWANLAB:
+                try:
+                    swanlab.init(
+                        project="FASS-MoE-SSR",
+                        config=config.__dict__ if hasattr(config, '__dict__') else str(config),
+                        mode="cloud" # or "local"
+                    )
+                    print("🚀 SwanLab initialized.")
+                except Exception as e:
+                    print(f"⚠️ SwanLab init failed: {e}")
         
         self.generator = self.generator.to(self.device)
         self.discriminator = self.discriminator.to(self.device)
@@ -89,8 +102,8 @@ class FASSMoETrainer:
         
         self._setup_schedulers()
         
-        # Losses (LSGAN only)
-        self.adv_loss_fn = LSGANLoss().to(self.device)
+        # Losses (LSGAN)
+        self.d_criterion = DiscriminatorLoss().to(self.device)
             
         self.g_criterion = CombinedGeneratorLoss(
             lambda_recon=config.training.lambda_mr_stft,
@@ -102,14 +115,6 @@ class FASSMoETrainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_loss = float('inf')
-        
-        # TF32 is enabled by default on Ampere GPUs (A40)
-        # No explicit code needed - provides ~2x speedup automatically
-        if torch.cuda.is_available():
-            torch.backends.cuda.matmul.allow_tf32 = True
-            torch.backends.cudnn.allow_tf32 = True
-            if self.is_main_process:
-                print("🚀 TF32 enabled for matmul and cuDNN")
     
     def _setup_schedulers(self):
         steps_per_epoch = len(self.train_loader) // self.grad_accum_steps
@@ -129,7 +134,7 @@ class FASSMoETrainer:
     
     def train(self) -> None:
         if self.is_main_process:
-            print(f"Starting SOTA Training | Device: {self.device} | GAN Start: {self.gan_start_epoch}")
+            print(f"Starting Training | Device: {self.device} | GAN Start: {self.gan_start_epoch}")
         
         for epoch in range(self.current_epoch, self.config.training.num_epochs):
             if self.distributed:
@@ -143,11 +148,11 @@ class FASSMoETrainer:
             
             # Validation
             if self.val_loader and (epoch + 1) % self.config.training.val_interval == 0:
-                val_metrics = self.validate()
+                val_metrics = self.validate(epoch)
                 if self.is_main_process:
                     self._log_metrics(val_metrics, "val", epoch)
-                    if val_metrics['total_loss'] < self.best_val_loss:
-                        self.best_val_loss = val_metrics['total_loss']
+                    if val_metrics['lsd'] < self.best_val_loss: # Use LSD as best model metric
+                        self.best_val_loss = val_metrics['lsd']
                         self.save_checkpoint(self.checkpoint_dir / "best_model.pt")
             
             # Checkpoint
@@ -199,13 +204,9 @@ class FASSMoETrainer:
                     postfix['d_loss'] = f"{step_metrics['d_loss']:.4f}"
                 pbar.set_postfix(postfix)
                 
-                # Log step-level metrics to SwanLab (with error handling)
+                # Log step-level metrics to SwanLab
                 if HAS_SWANLAB and self.enable_logging and self.global_step % 10 == 0:
-                    try:
-                        swanlab.log({f"train/step_{k}": v for k, v in step_metrics.items()}, step=self.global_step)
-                    except Exception as e:
-                        if self.global_step <= 10:  # Only warn once
-                            print(f"⚠️ SwanLab log failed: {e}")
+                    swanlab.log({f"train/step_{k}": v for k, v in step_metrics.items()}, step=self.global_step)
         
         return {k: v / max(1, num_batches) for k, v in metrics_sum.items()}
     
@@ -216,15 +217,15 @@ class FASSMoETrainer:
         gen_module = self.generator.module if self.distributed else self.generator
         
         # ===================================================================================
-        # 1. Discriminator Step
+        # 1. Discriminator Step (Only if warmed up)
         # ===================================================================================
         if use_gan:
             with torch.no_grad():
                 fake_high_res, _ = gen_module(low_res, band_id=band_id)
             
             y_d_hat_r, y_d_hat_g, _, _ = self.discriminator(high_res, fake_high_res.detach())
-            d_loss = self.adv_loss_fn.discriminator_loss(y_d_hat_r, y_d_hat_g)
             
+            d_loss = self.d_criterion(y_d_hat_r, y_d_hat_g)
             (d_loss / self.grad_accum_steps).backward()
             
             if update:
@@ -271,10 +272,11 @@ class FASSMoETrainer:
         return metrics
 
     @torch.no_grad()
-    def validate(self):
+    def validate(self, epoch: int):
         gen_module = self.generator.module if self.distributed else self.generator
         gen_module.eval()
-        total_loss = 0.0
+        
+        metrics = {'lsd': 0.0, 'sisnr': 0.0, 'mr_stft': 0.0}
         count = 0
         
         # Tqdm for validation (only main process)
@@ -282,17 +284,48 @@ class FASSMoETrainer:
             loader = tqdm(self.val_loader, desc="Validating", leave=False)
         else:
             loader = self.val_loader
-        
-        for low, high, band_id in loader:
+            
+        for i, (low, high, band_id) in enumerate(loader):
             low, high = low.to(self.device), high.to(self.device)
             band_id = band_id.to(self.device)
             
             fake, _ = gen_module(low, band_id=band_id)
+            
+            # Compute Metrics
             sc, mag = self.g_criterion.mr_stft(fake, high)
-            total_loss += (sc + mag).item()
+            metrics['mr_stft'] += (sc + mag).item()
+            metrics['lsd'] += compute_lsd(fake, high)
+            metrics['sisnr'] += compute_sisnr(fake, high)
             count += 1
             
-        return {'total_loss': total_loss / max(1, count)}
+            # Save Audio (First batch of first rank only)
+            if self.is_main_process and i == 0:
+                self._save_val_audio(low, high, fake, epoch)
+            
+        return {k: v / max(1, count) for k, v in metrics.items()}
+
+    def _save_val_audio(self, low, high, fake, epoch):
+        """Save sample audio files."""
+        # Save up to 2 samples
+        for j in range(min(2, low.shape[0])):
+            # Save Low Res
+            torchaudio.save(
+                str(self.samples_dir / f"epoch_{epoch+1}_sample_{j}_lr.wav"),
+                low[j].cpu().detach(), 
+                self.config.audio.target_sr # It's upsampled to target_sr length already
+            )
+            # Save High Res (Target)
+            torchaudio.save(
+                str(self.samples_dir / f"epoch_{epoch+1}_sample_{j}_hr.wav"),
+                high[j].cpu().detach(), 
+                self.config.audio.target_sr
+            )
+            # Save Generated
+            torchaudio.save(
+                str(self.samples_dir / f"epoch_{epoch+1}_sample_{j}_gen.wav"),
+                fake[j].cpu().detach(), 
+                self.config.audio.target_sr
+            )
 
     def _log_metrics(self, metrics, prefix, epoch):
         if not self.is_main_process: return
@@ -302,10 +335,7 @@ class FASSMoETrainer:
         
         # SwanLab log
         if HAS_SWANLAB and self.enable_logging:
-            try:
-                swanlab.log({f"{prefix}/{k}": v for k, v in metrics.items()}, step=self.global_step)
-            except Exception:
-                pass  # Fail silently for epoch-level logs
+            swanlab.log({f"{prefix}/{k}": v for k, v in metrics.items()}, step=self.global_step)
 
     def save_checkpoint(self, path):
         if not self.is_main_process: return

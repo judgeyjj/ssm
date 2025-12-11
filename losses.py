@@ -1,5 +1,5 @@
 """
-Loss functions for FASS-MoE training (SOTA HiFi-GAN style).
+Loss functions for FASS-MoE training (HiFi-GAN style).
 
 Implements LSGAN, Feature Matching, and Mel-Spectrogram losses.
 Adapted for Multi-Period (MPD) and Multi-Scale (MSD) discriminators.
@@ -103,7 +103,7 @@ class DiscriminatorLoss(nn.Module):
 
 class CombinedGeneratorLoss(nn.Module):
     """
-    Combined generator loss for FASS-MoE (SOTA Config).
+    Combined generator loss for FASS-MoE.
     Uses LSGAN for adversarial loss.
     """
     def __init__(

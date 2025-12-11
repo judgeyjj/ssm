@@ -2,7 +2,7 @@
 HiFi-GAN Discriminators (MPD + MSD).
 
 Reference: https://github.com/jik876/hifi-gan
-Standard configuration for SOTA speech generation/super-resolution.
+Standard configuration for speech generation/super-resolution.
 """
 
 from typing import List, Tuple
