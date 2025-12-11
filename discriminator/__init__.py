@@ -1,26 +1,16 @@
 """
-Projected GAN Discriminator components.
-
-Contains ViT-based discriminator using frozen features with
-learnable projection heads.
+SOTA Discriminator components.
 """
 
-from discriminator.mel import MelSpectrogram
-from discriminator.vit import SimpleViT, TransformerBlock
-from discriminator.projected_gan import (
-    ProjectedDiscriminator,
-    RandomProjection,
-    DiscriminatorHead,
-    build_discriminator,
-)
+from discriminator.hifi import HiFiDiscriminator
+
+def build_discriminator(config):
+    """Build HiFi-GAN style discriminator."""
+    # Config is not strictly needed for standard HiFi-GAN D, 
+    # but kept for interface compatibility.
+    return HiFiDiscriminator()
 
 __all__ = [
-    "MelSpectrogram",
-    "SimpleViT",
-    "TransformerBlock",
-    "ProjectedDiscriminator",
-    "RandomProjection",
-    "DiscriminatorHead",
+    "HiFiDiscriminator",
     "build_discriminator",
 ]
-
