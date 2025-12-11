@@ -24,16 +24,17 @@ from config import get_default_config
 from generator import build_generator
 from losses import MultiResolutionSTFTLoss
 
-def create_single_sample_dataset(root_dir: Path, length: int = 48000):
-    """Create a single deterministic sine wave sample."""
+def create_single_sample_dataset(root_dir: Path, length: int = 96000):
+    """Create a single deterministic sine wave sample (2 seconds at 48kHz)."""
     root_dir.mkdir(exist_ok=True, parents=True)
     
-    # Create a complex signal: Sum of sines
-    t = torch.linspace(0, 1, length)
+    # Create a complex signal: Sum of sines with harmonics
+    t = torch.linspace(0, length / 48000, length)
     wav = (
         0.5 * torch.sin(2 * torch.pi * 440 * t) + 
         0.3 * torch.sin(2 * torch.pi * 880 * t) +
-        0.1 * torch.sin(2 * torch.pi * 1760 * t)
+        0.1 * torch.sin(2 * torch.pi * 1760 * t) +
+        0.05 * torch.sin(2 * torch.pi * 3520 * t)  # High frequency component
     )
     wav = wav.unsqueeze(0)  # (1, T)
     
@@ -43,40 +44,44 @@ def create_single_sample_dataset(root_dir: Path, length: int = 48000):
 
 class SingleSampleDataset(Dataset):
     """Dataset that returns the SAME sample every time."""
-    def __init__(self, path, config, scale_factor=1):
+    def __init__(self, path, config):
         self.path = path
         self.config = config
-        self.scale_factor = scale_factor
+        
+        # Compute scale factor from config
+        self.scale_factor = config.audio.target_sr // config.audio.input_sr
         
         # Load once
-        self.hr, _ = torchaudio.load(str(path))
+        self.hr, sr = torchaudio.load(str(path))
         
-        # Create LR based on scale_factor
-        if scale_factor > 1:
-            # Traditional SR: downsample
-            from dataset import LowPassFilter
-            lpf = LowPassFilter(config.audio.input_sr // 2, config.audio.target_sr)
-            resampler = torchaudio.transforms.Resample(
-                config.audio.target_sr, config.audio.input_sr, 
-                resampling_method="sinc_interp_kaiser"
-            )
-            self.lr = resampler(lpf(self.hr))
-        else:
-            # Bandwidth extension: same SR, just lowpass
-            from dataset import LowPassFilter
-            # Pick a random effective SR for test (e.g., 8kHz bandwidth)
-            effective_sr = 8000
-            lpf = LowPassFilter(effective_sr // 2, config.audio.target_sr)
-            down = torchaudio.transforms.Resample(config.audio.target_sr, effective_sr)
-            up = torchaudio.transforms.Resample(effective_sr, config.audio.target_sr)
-            self.lr = up(down(lpf(self.hr)))
+        # Resample to target_sr if needed
+        if sr != config.audio.target_sr:
+            resample_to_target = torchaudio.transforms.Resample(sr, config.audio.target_sr)
+            self.hr = resample_to_target(self.hr)
         
-        # Crop to exact training size
+        # Create LR via degradation pipeline
+        from dataset import LowPassFilter
+        cutoff = config.audio.input_sr / 2  # Nyquist of input
+        self.lpf = LowPassFilter(cutoff, config.audio.target_sr)
+        
+        # Downsample then upsample back (to match main dataset behavior)
+        down_resampler = torchaudio.transforms.Resample(
+            config.audio.target_sr, config.audio.input_sr, 
+            resampling_method="sinc_interp_kaiser"
+        )
+        up_resampler = torchaudio.transforms.Resample(
+            config.audio.input_sr, config.audio.target_sr,
+            resampling_method="sinc_interp_kaiser"
+        )
+        
+        # LR at target_sr (band-limited but same sample rate as HR)
+        lr_downsampled = down_resampler(self.lpf(self.hr))
+        self.lr = up_resampler(lr_downsampled)
+        
+        # Crop to segment_length (both at target_sr now)
         seg_len = config.audio.segment_length
-        lr_len = seg_len // max(scale_factor, 1)
-        
         self.hr = self.hr[:, :seg_len]
-        self.lr = self.lr[:, :lr_len]
+        self.lr = self.lr[:, :seg_len]  # Same length as HR!
         
         # Dummy band_id
         self.band_id = torch.tensor(0, dtype=torch.long)
@@ -98,11 +103,12 @@ def train_overfit():
     
     # 1. Setup Config & Data
     config = get_default_config()
-    # Use small model for fast iteration check
+    # Use small model for fast iteration
     config.model.hidden_channels = 32 
     config.model.num_moe_layers = 4
-    # Ensure correct upsampling ratio for test (16k -> 48k = 3x)
-    config.audio.input_sr = 16000
+    # Bandwidth extension mode: both at 48kHz, scale_factor = 1
+    # (This matches the main config where input_sr == target_sr)
+    config.audio.input_sr = 48000
     config.audio.target_sr = 48000
     
     temp_dir = Path("temp_overfit_data")
@@ -125,7 +131,7 @@ def train_overfit():
     # 3. Training Loop
     generator.train()
     
-    # Check if generator accepts band_id (do this once, not in loop)
+    # Check if generator accepts band_id (do once, not every iteration)
     import inspect
     sig = inspect.signature(generator.forward)
     use_band_id = 'band_id' in sig.parameters
