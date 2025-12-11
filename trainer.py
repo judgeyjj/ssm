@@ -196,9 +196,14 @@ class FASSMoETrainer:
                 # Real-time LSD calculation (sample few items to avoid overhead)
                 if batch_idx % 50 == 0:  # Compute every 50 batches to save time
                      with torch.no_grad():
-                        # Use a small chunk or the first item to compute rough LSD
-                         lsd_val = compute_lsd(fake_high_res[:1], high_res[:1])
-                         postfix['lsd'] = f"{lsd_val:.2f}"
+                        # We need to run inference to get fake_high_res if it wasn't returned by train_step or if we want to be clean
+                        # But wait, we can't easily access 'fake_high_res' here because it's inside train_step and not returned.
+                        # We should re-run inference on a small batch for logging purposes.
+                        gen_module = self.generator.module if self.distributed else self.generator
+                        eval_fake, _ = gen_module(low_res[:1], band_id=band_id[:1])
+                        
+                        lsd_val = compute_lsd(eval_fake, high_res[:1])
+                        postfix['lsd'] = f"{lsd_val:.2f}"
                          
                 pbar.set_postfix(postfix)
                 
