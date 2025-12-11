@@ -1,8 +1,8 @@
 """
-Overfitting Test Script.
+Overfitting Test Script (Updated).
 
 验证 Generator 是否有能力"背下"单个样本。
-这是验证模型容量和梯度流的最简单有效的方法。
+适配了新的 Trainer 接口 (band_id) 和 Config。
 
 Training Mode:
 - Generator ONLY (No Discriminator, No GAN Loss)
@@ -12,7 +12,6 @@ Training Mode:
 
 import os
 import shutil
-import tempfile
 from pathlib import Path
 
 import torch
@@ -29,7 +28,7 @@ def create_single_sample_dataset(root_dir: Path, length: int = 48000):
     """Create a single deterministic sine wave sample."""
     root_dir.mkdir(exist_ok=True, parents=True)
     
-    # Create a complex signal: Sum of sines to make it non-trivial
+    # Create a complex signal: Sum of sines
     t = torch.linspace(0, 1, length)
     wav = (
         0.5 * torch.sin(2 * torch.pi * 440 * t) + 
@@ -49,30 +48,32 @@ class SingleSampleDataset(Dataset):
         self.config = config
         # Load once
         self.hr, _ = torchaudio.load(str(path))
-
-        # For sanity overfit: let LR == HR (identity mapping at 48k)
-        self.lr = self.hr.clone()
-
-        # Crop / pad to exact training size so that LR and HR have same length
-        seg_len = config.audio.segment_length
-
-        def _crop_or_pad(x):
-            cur_len = x.shape[-1]
-            if cur_len < seg_len:
-                pad = seg_len - cur_len
-                return torch.nn.functional.pad(x, (0, pad), mode="constant", value=0.0)
-            return x[:, :seg_len]
-
-        self.hr = _crop_or_pad(self.hr)
-        self.lr = _crop_or_pad(self.lr)
         
-        # Only one band for identity overfit
-        self.band_id = 0
+        # Create LR manually (Blind SR simulation)
+        from dataset import LowPassFilter
+        self.lpf = LowPassFilter(8000, 48000)
+        self.resampler = torchaudio.transforms.Resample(
+            48000, 16000, resampling_method="sinc_interp_kaiser"
+        )
+        
+        # Create LR
+        self.lr = self.resampler(self.lpf(self.hr))
+        
+        # Crop to exact training size
+        seg_len = config.audio.segment_length
+        lr_len = seg_len // 3  # Assuming 3x upsampling for this test
+        
+        self.hr = self.hr[:, :seg_len]
+        self.lr = self.lr[:, :lr_len]
+        
+        # Dummy band_id (assuming standard single band or band 0)
+        self.band_id = torch.tensor(0, dtype=torch.long)
         
     def __len__(self):
         return 100  # Pretend we have 100 samples per epoch
     
     def __getitem__(self, idx):
+        # Return triplet: (LR, HR, BAND_ID)
         return self.lr, self.hr, self.band_id
 
 def train_overfit():
@@ -85,14 +86,12 @@ def train_overfit():
     
     # 1. Setup Config & Data
     config = get_default_config()
-    # For overfit sanity check: force 48k->48k identity setting
-    config.audio.input_sr = 48000
-    config.audio.target_sr = 48000
-    # Only one effective band so band_id is always 0
-    config.audio.effective_srs = [48000]
     # Use small model for fast iteration check
     config.model.hidden_channels = 32 
     config.model.num_moe_layers = 4
+    # Ensure correct upsampling ratio for test (16k -> 48k = 3x)
+    config.audio.input_sr = 16000
+    config.audio.target_sr = 48000
     
     temp_dir = Path("temp_overfit_data")
     if temp_dir.exists(): shutil.rmtree(temp_dir)
@@ -102,8 +101,10 @@ def train_overfit():
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
     
     # 2. Setup Model & Optimizer
+    # Note: Generator forward now might expect band_id if you modified it to accept it
+    # We build it standard way
     generator = build_generator(config).to(device)
-    optimizer = AdamW(generator.parameters(), lr=1e-3) # Higher LR for quick convergence
+    optimizer = AdamW(generator.parameters(), lr=1e-3) 
     criterion = MultiResolutionSTFTLoss().to(device)
     
     print("✅ Model created. Starting training loop...")
@@ -118,11 +119,19 @@ def train_overfit():
             steps = 0
             
             for lr, hr, band_id in dataloader:
-                lr, hr, band_id = lr.to(device), hr.to(device), band_id.to(device)
+                lr = lr.to(device)
+                hr = hr.to(device)
+                band_id = band_id.to(device)
                 
                 optimizer.zero_grad()
                 
-                fake, _ = generator(lr, band_id=band_id)
+                # Check if generator accepts band_id
+                import inspect
+                sig = inspect.signature(generator.forward)
+                if 'band_id' in sig.parameters:
+                    fake, _ = generator(lr, band_id=band_id)
+                else:
+                    fake, _ = generator(lr)
                 
                 # Compute only Reconstruction Loss
                 sc_loss, mag_loss = criterion(fake, hr)
@@ -140,15 +149,17 @@ def train_overfit():
             # Save intermediate result
             if epoch % 10 == 0:
                 out_path = Path(f"overfit_epoch_{epoch}.wav")
-                # Save generated audio
                 torchaudio.save(str(out_path), fake[0].cpu().detach(), 48000)
                 print(f"   Saved output to {out_path}")
                 
     except KeyboardInterrupt:
         print("Stopped by user.")
+    except Exception as e:
+        print(f"❌ Training failed: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         if temp_dir.exists(): shutil.rmtree(temp_dir)
 
 if __name__ == "__main__":
     train_overfit()
-
