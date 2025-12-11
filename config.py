@@ -71,9 +71,9 @@ class TrainingConfig:
     val_interval: int = 1
     grad_clip: float = 10.0
     gan_start_epoch: int = 10     # Warmup generator with only recon loss for 10 epochs
-    lambda_mr_stft: float = 1.0
+    lambda_mr_stft: float = 45.0  # Increased to match HiFi-GAN/BigVGAN standard
     lambda_fm: float = 2.0
-    lambda_adv: float = 0.1
+    lambda_adv: float = 1.0       # Increased to match standard GAN loss scale
     lambda_aux: float = 1.0
     gan_type: str = "hinge"  # 'hinge' or 'lsgan'
 
