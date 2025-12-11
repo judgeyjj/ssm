@@ -192,11 +192,22 @@ class FASSMoETrainer:
                 }
                 if 'd_loss' in step_metrics:
                     postfix['d_loss'] = f"{step_metrics['d_loss']:.4f}"
+                
+                # Real-time LSD calculation (sample few items to avoid overhead)
+                if batch_idx % 50 == 0:  # Compute every 50 batches to save time
+                     with torch.no_grad():
+                        # Use a small chunk or the first item to compute rough LSD
+                         lsd_val = compute_lsd(fake_high_res[:1], high_res[:1])
+                         postfix['lsd'] = f"{lsd_val:.2f}"
+                         
                 pbar.set_postfix(postfix)
                 
                 # Log step-level metrics to SwanLab
                 if HAS_SWANLAB and self.enable_logging and self.global_step % 10 == 0:
-                    swanlab.log({f"train/step_{k}": v for k, v in step_metrics.items()}, step=self.global_step)
+                    log_dict = {f"train/step_{k}": v for k, v in step_metrics.items()}
+                    if 'lsd_val' in locals():
+                        log_dict['train/step_lsd'] = lsd_val
+                    swanlab.log(log_dict, step=self.global_step)
         
         return {k: v / max(1, num_batches) for k, v in metrics_sum.items()}
     
