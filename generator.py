@@ -381,10 +381,11 @@ def _init_weights(module: nn.Module) -> None:
     """Initialize model weights."""
     for m in module.modules():
         if isinstance(m, nn.Conv1d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            # Use fan_in for GELU/SiLU activations (closer to linear behavior)
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='linear')
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
         elif isinstance(m, nn.Linear):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='linear')
             if m.bias is not None:
                 nn.init.zeros_(m.bias)

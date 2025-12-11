@@ -1,6 +1,6 @@
 """
 Training loop for FASS-MoE Speech Super-Resolution (SOTA HiFi-GAN style).
-Supports Generator Warmup.
+Supports Generator Warmup and DistributedDataParallel.
 """
 
 from pathlib import Path
@@ -8,6 +8,7 @@ from typing import Dict, Optional
 
 import torch
 import torch.nn as nn
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -32,6 +33,8 @@ class FASSMoETrainer:
         val_loader: Optional[DataLoader] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         checkpoint_dir: str = "checkpoints",
+        distributed: bool = False,
+        local_rank: int = 0,
     ):
         self.config = config
         self.generator = generator
@@ -44,6 +47,14 @@ class FASSMoETrainer:
         
         self.generator = self.generator.to(self.device)
         self.discriminator = self.discriminator.to(self.device)
+        self.distributed = distributed
+        self.local_rank = local_rank
+        
+        # Wrap with DDP if distributed
+        if self.distributed:
+            self.generator = DDP(self.generator, device_ids=[local_rank], output_device=local_rank)
+            self.discriminator = DDP(self.discriminator, device_ids=[local_rank], output_device=local_rank)
+        
         self.grad_accum_steps = config.training.grad_accum_steps
         self.gan_start_epoch = config.training.gan_start_epoch
         
@@ -120,11 +131,13 @@ class FASSMoETrainer:
         self.optimizer_g.zero_grad()
         self.optimizer_d.zero_grad()
         
-        for batch_idx, (low_res, high_res) in enumerate(self.train_loader):
-            low_res, high_res = low_res.to(self.device), high_res.to(self.device)
+        for batch_idx, (low_res, high_res, band_id) in enumerate(self.train_loader):
+            low_res = low_res.to(self.device)
+            high_res = high_res.to(self.device)
+            band_id = band_id.to(self.device)
             
             is_update = (batch_idx + 1) % self.grad_accum_steps == 0
-            step_metrics = self.train_step(low_res, high_res, is_update, epoch)
+            step_metrics = self.train_step(low_res, high_res, band_id, is_update, epoch)
             
             for k, v in step_metrics.items():
                 metrics_sum[k] = metrics_sum.get(k, 0.0) + v
@@ -145,16 +158,19 @@ class FASSMoETrainer:
         
         return {k: v / max(1, num_batches) for k, v in metrics_sum.items()}
     
-    def train_step(self, low_res, high_res, update, epoch):
+    def train_step(self, low_res, high_res, band_id, update, epoch):
         metrics = {}
         use_gan = epoch >= self.gan_start_epoch
+        
+        # Get the underlying model for forward calls (handles DDP wrapper)
+        gen_module = self.generator.module if self.distributed else self.generator
         
         # ===================================================================================
         # 1. Discriminator Step (Only if warmed up)
         # ===================================================================================
         if use_gan:
             with torch.no_grad():
-                fake_high_res, _ = self.generator(low_res)
+                fake_high_res, _ = gen_module(low_res, band_id=band_id)
             
             y_d_hat_r, y_d_hat_g, _, _ = self.discriminator(high_res, fake_high_res.detach())
             
@@ -171,7 +187,7 @@ class FASSMoETrainer:
         # ===================================================================================
         # 2. Generator Step
         # ===================================================================================
-        fake_high_res, aux_loss = self.generator(low_res)
+        fake_high_res, aux_loss = gen_module(low_res, band_id=band_id)
         
         if use_gan:
             y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.discriminator(high_res, fake_high_res)
@@ -211,12 +227,15 @@ class FASSMoETrainer:
 
     @torch.no_grad()
     def validate(self):
-        self.generator.eval()
+        gen_module = self.generator.module if self.distributed else self.generator
+        gen_module.eval()
         total_loss = 0.0
         count = 0
-        for low, high in self.val_loader:
-            low, high = low.to(self.device), high.to(self.device)
-            fake, _ = self.generator(low)
+        for low, high, band_id in self.val_loader:
+            low = low.to(self.device)
+            high = high.to(self.device)
+            band_id = band_id.to(self.device)
+            fake, _ = gen_module(low, band_id=band_id)
             sc, mag = self.g_criterion.mr_stft(fake, high)
             total_loss += (sc + mag).item()
             count += 1
@@ -246,7 +265,7 @@ class FASSMoETrainer:
         print(f"Loaded checkpoint: {path}")
 
 
-def create_trainer(config: FASSMoEConfig, train_loader, val_loader=None, device="cuda", checkpoint_dir="checkpoints"):
+def create_trainer(config: FASSMoEConfig, train_loader, val_loader=None, device="cuda", checkpoint_dir="checkpoints", distributed=False, local_rank=0):
     gen = build_generator(config)
     disc = build_discriminator(config)
-    return FASSMoETrainer(config, gen, disc, train_loader, val_loader, device, checkpoint_dir)
+    return FASSMoETrainer(config, gen, disc, train_loader, val_loader, device, checkpoint_dir, distributed, local_rank)

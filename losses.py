@@ -26,29 +26,26 @@ class MultiResolutionSTFTLoss(nn.Module):
         self.hop_sizes = hop_sizes or [50, 120, 240]
         self.win_sizes = win_sizes or [240, 600, 1200]
         
-        self.windows = nn.ParameterList([
-            nn.Parameter(torch.hann_window(w), requires_grad=False)
-            for w in self.win_sizes
-        ])
+        # Register windows as buffers (non-trainable, auto device placement)
+        for i, w in enumerate(self.win_sizes):
+            self.register_buffer(f'window_{i}', torch.hann_window(w))
     
-    def _stft(self, x, fft_size, hop_size, win_size, window):
-        window = window.to(x.device)
-        if win_size < fft_size:
-            pad = (fft_size - win_size) // 2
-            window = F.pad(window, (pad, fft_size - win_size - pad))
-        if x.dim() == 3: x = x.squeeze(1)
+    def _stft(self, x, fft_size, hop_size, win_size, window_idx):
+        window = getattr(self, f'window_{window_idx}')
+        if x.dim() == 3: 
+            x = x.squeeze(1)
         stft = torch.stft(x, n_fft=fft_size, hop_length=hop_size, win_length=win_size, 
-                          window=window[:win_size], return_complex=True)
+                          window=window, return_complex=True)
         return stft.abs()
     
     def forward(self, pred, target):
         sc_loss = 0.0
         mag_loss = 0.0
-        for fft_size, hop_size, win_size, window in zip(
-            self.fft_sizes, self.hop_sizes, self.win_sizes, self.windows
-        ):
-            pred_mag = self._stft(pred, fft_size, hop_size, win_size, window)
-            target_mag = self._stft(target, fft_size, hop_size, win_size, window)
+        for i, (fft_size, hop_size, win_size) in enumerate(zip(
+            self.fft_sizes, self.hop_sizes, self.win_sizes
+        )):
+            pred_mag = self._stft(pred, fft_size, hop_size, win_size, i)
+            target_mag = self._stft(target, fft_size, hop_size, win_size, i)
             
             sc_loss += torch.norm(target_mag - pred_mag, p='fro') / (torch.norm(target_mag, p='fro') + 1e-8)
             mag_loss += F.l1_loss(torch.log(pred_mag + 1e-8), torch.log(target_mag + 1e-8))

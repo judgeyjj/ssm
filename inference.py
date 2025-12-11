@@ -52,9 +52,14 @@ def load_model(config_path: str, checkpoint_path: str, device: str):
     print(f"Loading checkpoint from {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device)
     
-    if 'generator_state_dict' in checkpoint:
+    if 'generator' in checkpoint:
+        # Trained with trainer.py
+        model.load_state_dict(checkpoint['generator'])
+    elif 'generator_state_dict' in checkpoint:
+        # Alternative key name (backwards compatibility)
         model.load_state_dict(checkpoint['generator_state_dict'])
     else:
+        # Raw state dict
         model.load_state_dict(checkpoint)
     
     model.eval()

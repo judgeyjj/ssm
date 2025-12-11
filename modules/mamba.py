@@ -193,11 +193,13 @@ class MambaBlock(nn.Module):
             
             # Run kernel
             # returns (B, D, L)
+            # Note: selective_scan_fn already incorporates D internally when D_in is provided
+            # So we don't need to add it separately like in the Python fallback
             y = selective_scan_fn(
                 u, delta, A_in, B_in, C_in, D_in,
                 z=None,
                 delta_bias=None,
-                delta_softplus=True,
+                delta_softplus=False,  # We already applied softplus above
                 return_last_state=False
             )
             
