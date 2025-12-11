@@ -58,7 +58,7 @@ class DiscriminatorConfig:
 class TrainingConfig:
     """Training hyperparameters."""
     batch_size: int = 16
-    grad_accum_steps: int = 1
+    grad_accum_steps: int = 2
     learning_rate_g: float = 2e-4
     learning_rate_d: float = 2e-4
     betas: Tuple[float, float] = (0.8, 0.99)
@@ -69,13 +69,13 @@ class TrainingConfig:
     checkpoint_interval: int = 5
     log_interval: int = 100
     val_interval: int = 1
-    grad_clip: float = 10.0
-    gan_start_epoch: int = 10     # Warmup generator with only recon loss for 10 epochs
-    lambda_mr_stft: float = 45.0  # Increased to match HiFi-GAN/BigVGAN standard
+    grad_clip: float = 1.0
+    gan_start_epoch: int = 20
+    # Loss Weights (HiFi-GAN / AudioSR style)
+    lambda_mr_stft: float = 45.0
     lambda_fm: float = 2.0
-    lambda_adv: float = 1.0       # Increased to match standard GAN loss scale
-    lambda_aux: float = 1.0
-    gan_type: str = "hinge"  # 'hinge' or 'lsgan'
+    lambda_adv: float = 1.0
+    lambda_aux: float = 0.01
 
 
 @dataclass

@@ -104,13 +104,14 @@ class DiscriminatorLoss(nn.Module):
 class CombinedGeneratorLoss(nn.Module):
     """
     Combined generator loss for FASS-MoE (SOTA Config).
+    Uses LSGAN for adversarial loss.
     """
     def __init__(
         self,
-        lambda_recon: float = 45.0, # STFT
+        lambda_recon: float = 45.0, # STFT (HiFi-GAN default)
         lambda_fm: float = 2.0,     # Feature Matching
         lambda_adv: float = 1.0,    # GAN
-        lambda_aux: float = 1.0,    # Load Balance
+        lambda_aux: float = 0.01,   # Load Balance (small weight)
     ):
         super().__init__()
         self.lambda_recon = lambda_recon
@@ -156,3 +157,26 @@ class CombinedGeneratorLoss(nn.Module):
             'fm': fm_loss.item(),
             'aux': aux_loss.item() if torch.is_tensor(aux_loss) else aux_loss
         }
+
+
+class LSGANLoss(nn.Module):
+    """
+    LSGAN Loss (Least Squares GAN).
+    D_loss = (D(real) - 1)^2 + D(fake)^2
+    G_loss = (D(fake) - 1)^2
+    """
+    def __init__(self):
+        super().__init__()
+    
+    def discriminator_loss(self, real_outputs: List[torch.Tensor], fake_outputs: List[torch.Tensor]) -> torch.Tensor:
+        loss = 0.0
+        for dr, dg in zip(real_outputs, fake_outputs):
+            loss += torch.mean((dr - 1) ** 2) + torch.mean(dg ** 2)
+        return loss
+    
+    def generator_loss(self, fake_outputs: List[torch.Tensor]) -> torch.Tensor:
+        loss = 0.0
+        for dg in fake_outputs:
+            loss += torch.mean((dg - 1) ** 2)
+        return loss
+

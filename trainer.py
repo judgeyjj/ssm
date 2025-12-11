@@ -24,7 +24,7 @@ except ImportError:
 from config import FASSMoEConfig
 from discriminator import build_discriminator, HiFiDiscriminator
 from generator import FASSMoEGenerator, build_generator
-from losses import CombinedGeneratorLoss, DiscriminatorLoss, LSGANLoss, HingeLoss
+from losses import CombinedGeneratorLoss, LSGANLoss
 
 
 class FASSMoETrainer:
@@ -97,14 +97,10 @@ class FASSMoETrainer:
         
         self._setup_schedulers()
         
-        # Dynamic Loss Selection
-        if config.training.gan_type == "lsgan":
-            self.adv_loss_fn = LSGANLoss().to(self.device)
-        else:
-            self.adv_loss_fn = HingeLoss().to(self.device)
+        # Losses (LSGAN only)
+        self.adv_loss_fn = LSGANLoss().to(self.device)
             
         self.g_criterion = CombinedGeneratorLoss(
-            gan_type=config.training.gan_type,
             lambda_recon=config.training.lambda_mr_stft,
             lambda_fm=config.training.lambda_fm,
             lambda_adv=config.training.lambda_adv,
