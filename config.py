@@ -74,6 +74,7 @@ class TrainingConfig:
     lambda_fm: float = 2.0
     lambda_adv: float = 0.1
     lambda_aux: float = 1.0
+    gan_type: str = "hinge"  # 'hinge' or 'lsgan'
 
 
 @dataclass

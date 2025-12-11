@@ -142,6 +142,11 @@ def main():
     finally:
         if distributed and dist.is_initialized():
             dist.destroy_process_group()
+        if _SWANLAB_AVAILABLE and (not distributed or rank == 0):
+            try:
+                swanlab.finish()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

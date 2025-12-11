@@ -245,6 +245,36 @@ class HingeLoss(nn.Module):
         return loss / len(fake_logits)
 
 
+class LSGANLoss(nn.Module):
+    """Least Squares GAN loss (LSGAN)."""
+    def __init__(self):
+        super().__init__()
+
+    def discriminator_loss(
+        self,
+        real_logits: List[torch.Tensor],
+        fake_logits: List[torch.Tensor],
+    ) -> torch.Tensor:
+        """LSGAN discriminator loss.
+
+        For each scale: 0.5 * E[(D(real) - 1)^2 + (D(fake))^2]
+        """
+        loss = 0.0
+        for real, fake in zip(real_logits, fake_logits):
+            loss = loss + 0.5 * ((real - 1.0) ** 2).mean() + 0.5 * (fake ** 2).mean()
+        return loss / len(real_logits)
+
+    def generator_loss(self, fake_logits: List[torch.Tensor]) -> torch.Tensor:
+        """LSGAN generator loss.
+
+        For each scale: 0.5 * E[(D(fake) - 1)^2]
+        """
+        loss = 0.0
+        for fake in fake_logits:
+            loss = loss + 0.5 * ((fake - 1.0) ** 2).mean()
+        return loss / len(fake_logits)
+
+
 class CombinedGeneratorLoss(nn.Module):
     """
     Combined generator loss for FASS-MoE training.

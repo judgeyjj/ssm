@@ -11,6 +11,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+import torchaudio
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
@@ -20,7 +21,7 @@ from tqdm import tqdm
 from config import FASSMoEConfig
 from discriminator import ProjectedDiscriminator, build_discriminator
 from generator import FASSMoEGenerator, build_generator
-from losses import MultiResolutionSTFTLoss, FeatureMatchingLoss, HingeLoss
+from losses import MultiResolutionSTFTLoss, FeatureMatchingLoss, HingeLoss, LSGANLoss
 
 try:
     import swanlab
@@ -104,7 +105,11 @@ class FASSMoETrainer:
         # Loss functions
         self.mr_stft_loss = MultiResolutionSTFTLoss().to(self.device)
         self.feature_matching_loss = FeatureMatchingLoss().to(self.device)
-        self.hinge_loss = HingeLoss().to(self.device)
+        gan_type = getattr(config.training, "gan_type", "hinge").lower()
+        if gan_type == "lsgan":
+            self.gan_loss = LSGANLoss().to(self.device)
+        else:
+            self.gan_loss = HingeLoss().to(self.device)
         
         # Loss weights
         self.lambda_adv = config.training.lambda_adv
@@ -149,12 +154,9 @@ class FASSMoETrainer:
                 self._log_metrics(train_metrics, "train", epoch)
             
             if self.val_loader is not None and (epoch + 1) % self.config.training.val_interval == 0:
-                val_metrics = self.validate()
+                val_metrics = self.validate(epoch)
                 if self.is_main_process:
                     self._log_metrics(val_metrics, "val", epoch)
-                    if val_metrics['total_loss'] < self.best_val_loss:
-                        self.best_val_loss = val_metrics['total_loss']
-                        self.save_checkpoint(self.checkpoint_dir / "best_model.pt")
             
             if self.is_main_process and (epoch + 1) % self.config.training.checkpoint_interval == 0:
                 self.save_checkpoint(self.checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pt")
@@ -230,7 +232,7 @@ class FASSMoETrainer:
         real_logits, real_features = self.discriminator(high_res)
         fake_logits, _ = self.discriminator(fake_high_res)
         
-        d_loss_full = self.hinge_loss.discriminator_loss(real_logits, fake_logits)
+        d_loss_full = self.gan_loss.discriminator_loss(real_logits, fake_logits)
         d_loss = d_loss_full / max(1, accum_steps)
         d_loss.backward()
         
@@ -244,7 +246,7 @@ class FASSMoETrainer:
         sc_loss, mag_loss = self.mr_stft_loss(fake_high_res, high_res)
         mr_stft_loss = sc_loss + mag_loss
         fm_loss = self.feature_matching_loss(real_features, fake_features)
-        adv_loss = self.hinge_loss.generator_loss(fake_logits)
+        adv_loss = self.gan_loss.generator_loss(fake_logits)
         
         g_loss_full = (
             self.lambda_recon * mr_stft_loss
@@ -265,13 +267,16 @@ class FASSMoETrainer:
         return metrics
     
     @torch.no_grad()
-    def validate(self) -> Dict[str, float]:
+    def validate(self, epoch: int) -> Dict[str, float]:
         """Run validation."""
         self.generator.eval()
         self.discriminator.eval()
         
         val_metrics = {'total_loss': 0.0, 'mr_stft_loss': 0.0, 'snr': 0.0}
         num_batches = 0
+        example_low = None
+        example_fake = None
+        example_high = None
         
         if self.is_main_process:
             iterator = tqdm(
@@ -297,9 +302,22 @@ class FASSMoETrainer:
             val_metrics['snr'] += snr.item()
             val_metrics['total_loss'] += mr_stft_loss.item()
             num_batches += 1
+
+            if example_low is None and low_res.size(0) > 0:
+                example_low = low_res[0].detach().cpu()
+                example_high = high_res[0].detach().cpu()
+                example_fake = fake_high_res[0].detach().cpu()
         
         for key in val_metrics:
             val_metrics[key] /= max(num_batches, 1)
+        
+        # Save best checkpoint and example audio
+        if self.is_main_process and num_batches > 0:
+            if val_metrics['total_loss'] < self.best_val_loss:
+                self.best_val_loss = val_metrics['total_loss']
+                self.save_checkpoint(self.checkpoint_dir / "best_model.pt")
+                if example_low is not None and example_fake is not None and example_high is not None:
+                    self._save_audio_examples(epoch, example_low, example_fake, example_high)
         
         return val_metrics
     
@@ -309,6 +327,30 @@ class FASSMoETrainer:
         signal_power = (target ** 2).mean()
         noise_power = (noise ** 2).mean()
         return 10 * torch.log10(signal_power / (noise_power + 1e-8))
+    
+    def _save_audio_examples(
+        self,
+        epoch: int,
+        low_res: torch.Tensor,
+        fake_high_res: torch.Tensor,
+        high_res: torch.Tensor,
+    ) -> None:
+        """Save example audio (LR, SR, HR) for qualitative inspection."""
+        out_dir = self.checkpoint_dir / "samples"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        sr = self.config.audio.target_sr
+
+        epoch_idx = epoch + 1
+        lr_path = out_dir / f"epoch_{epoch_idx:04d}_lr.wav"
+        sr_path = out_dir / f"epoch_{epoch_idx:04d}_sr.wav"
+        hr_path = out_dir / f"epoch_{epoch_idx:04d}_hr.wav"
+
+        try:
+            torchaudio.save(str(lr_path), low_res.cpu(), sr)
+            torchaudio.save(str(sr_path), fake_high_res.cpu(), sr)
+            torchaudio.save(str(hr_path), high_res.cpu(), sr)
+        except Exception:
+            pass
     
     def _log_metrics(self, metrics: Dict[str, float], prefix: str, epoch: int) -> None:
         """Log metrics to console."""
