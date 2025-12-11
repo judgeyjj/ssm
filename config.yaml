@@ -5,7 +5,7 @@ audio:
   n_fft: 1024
   hop_length: 256
   mel_channels: 80
-  effective_srs: [8000, 16000, 24000, 32000, 48000]
+  effective_srs: [8000, 16000, 24000, 32000]
 
 model:
   hidden_channels: 96

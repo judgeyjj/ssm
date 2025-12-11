@@ -28,7 +28,7 @@ class AudioConfig:
     mel_channels: int = 80
     fmin: float = 0.0
     fmax: float = 8000.0
-    effective_srs: List[int] = field(default_factory=lambda: [8000, 16000, 24000, 32000, 48000])
+    effective_srs: List[int] = field(default_factory=lambda: [8000, 16000, 24000, 32000])
 
 
 @dataclass
