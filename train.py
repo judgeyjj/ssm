@@ -45,6 +45,12 @@ def main():
         default=-1,
         help="Local rank for distributed training (used with torchrun)",
     )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        help="Path to checkpoint file to resume training from"
+    )
     args = parser.parse_args()
     
     # 1. Load Configuration
@@ -127,6 +133,10 @@ def main():
     )
     
     # 4. Start Training
+    if args.resume:
+        print(f"\n[Resuming Training] Loading checkpoint from {args.resume}")
+        trainer.load_checkpoint(args.resume)
+
     print("\n[Training Start]")
     try:
         trainer.train()
