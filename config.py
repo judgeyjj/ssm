@@ -70,6 +70,7 @@ class TrainingConfig:
     log_interval: int = 100
     val_interval: int = 1
     grad_clip: float = 10.0
+    gan_start_epoch: int = 10     # Warmup generator with only recon loss for 10 epochs
     lambda_mr_stft: float = 1.0
     lambda_fm: float = 2.0
     lambda_adv: float = 0.1

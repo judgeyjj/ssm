@@ -1,5 +1,6 @@
 """
 Training loop for FASS-MoE Speech Super-Resolution (SOTA HiFi-GAN style).
+Supports Generator Warmup.
 """
 
 from pathlib import Path
@@ -44,6 +45,7 @@ class FASSMoETrainer:
         self.generator = self.generator.to(self.device)
         self.discriminator = self.discriminator.to(self.device)
         self.grad_accum_steps = config.training.grad_accum_steps
+        self.gan_start_epoch = config.training.gan_start_epoch
         
         self.optimizer_g = AdamW(
             self.generator.parameters(),
@@ -91,6 +93,7 @@ class FASSMoETrainer:
     
     def train(self) -> None:
         print(f"Starting SOTA Training | Device: {self.device}")
+        print(f"GAN Start Epoch: {self.gan_start_epoch}")
         
         for epoch in range(self.current_epoch, self.config.training.num_epochs):
             self.current_epoch = epoch
@@ -121,7 +124,7 @@ class FASSMoETrainer:
             low_res, high_res = low_res.to(self.device), high_res.to(self.device)
             
             is_update = (batch_idx + 1) % self.grad_accum_steps == 0
-            step_metrics = self.train_step(low_res, high_res, is_update)
+            step_metrics = self.train_step(low_res, high_res, is_update, epoch)
             
             for k, v in step_metrics.items():
                 metrics_sum[k] = metrics_sum.get(k, 0.0) + v
@@ -129,37 +132,67 @@ class FASSMoETrainer:
             
             if is_update:
                 self.scheduler_g.step()
-                self.scheduler_d.step()
+                if epoch >= self.gan_start_epoch:
+                    self.scheduler_d.step()
                 self.global_step += 1
             
             if (batch_idx + 1) % self.config.training.log_interval == 0:
-                print(f"Epoch {epoch+1} [{batch_idx+1}] G: {step_metrics['g_loss']:.4f} D: {step_metrics['d_loss']:.4f}")
+                # Log reduced info
+                log_str = f"Epoch {epoch+1} [{batch_idx+1}] G: {step_metrics.get('g_loss', 0):.4f}"
+                if 'd_loss' in step_metrics:
+                    log_str += f" D: {step_metrics['d_loss']:.4f}"
+                print(log_str)
         
         return {k: v / max(1, num_batches) for k, v in metrics_sum.items()}
     
-    def train_step(self, low_res, high_res, update):
-        # 1. Discriminator Step
-        with torch.no_grad():
-            fake_high_res, _ = self.generator(low_res)
+    def train_step(self, low_res, high_res, update, epoch):
+        metrics = {}
+        use_gan = epoch >= self.gan_start_epoch
         
-        # MPD + MSD Forward
-        y_d_hat_r, y_d_hat_g, _, _ = self.discriminator(high_res, fake_high_res.detach())
-        
-        d_loss = self.d_criterion(y_d_hat_r, y_d_hat_g)
-        (d_loss / self.grad_accum_steps).backward()
-        
-        if update:
-            torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.config.training.grad_clip)
-            self.optimizer_d.step()
-            self.optimizer_d.zero_grad()
+        # ===================================================================================
+        # 1. Discriminator Step (Only if warmed up)
+        # ===================================================================================
+        if use_gan:
+            with torch.no_grad():
+                fake_high_res, _ = self.generator(low_res)
             
+            y_d_hat_r, y_d_hat_g, _, _ = self.discriminator(high_res, fake_high_res.detach())
+            
+            d_loss = self.d_criterion(y_d_hat_r, y_d_hat_g)
+            (d_loss / self.grad_accum_steps).backward()
+            
+            if update:
+                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.config.training.grad_clip)
+                self.optimizer_d.step()
+                self.optimizer_d.zero_grad()
+            
+            metrics['d_loss'] = d_loss.item()
+            
+        # ===================================================================================
         # 2. Generator Step
+        # ===================================================================================
         fake_high_res, aux_loss = self.generator(low_res)
-        y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.discriminator(high_res, fake_high_res)
         
-        g_loss, loss_dict = self.g_criterion(
-            fake_high_res, high_res, y_d_hat_g, fmap_r, fmap_g, aux_loss
-        )
+        if use_gan:
+            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.discriminator(high_res, fake_high_res)
+            
+            g_loss, loss_dict = self.g_criterion(
+                fake_high_res, high_res, y_d_hat_g, fmap_r, fmap_g, aux_loss
+            )
+        else:
+            # Warmup mode: Only Recon (STFT) + Aux
+            # Fake inputs for G criterion to ignore GAN parts
+            # We construct a minimal valid input for loss function or just verify MR-STFT manually
+            # Better to use g_criterion but mask the weights
+            # But here we just compute MR-STFT directly to save compute
+            
+            sc, mag = self.g_criterion.mr_stft(fake_high_res, high_res)
+            recon_loss = sc + mag
+            g_loss = self.config.training.lambda_mr_stft * recon_loss + \
+                     self.config.training.lambda_aux * aux_loss
+            
+            loss_dict = {'recon': recon_loss.item(), 'aux': aux_loss.item(), 'adv': 0.0, 'fm': 0.0}
+        
         (g_loss / self.grad_accum_steps).backward()
         
         if update:
@@ -167,8 +200,13 @@ class FASSMoETrainer:
             self.optimizer_g.step()
             self.optimizer_g.zero_grad()
             
-        metrics = {'d_loss': d_loss.item(), 'g_loss': g_loss.item()}
-        metrics.update({f"g_{k}": v for k, v in loss_dict.items()})
+        metrics['g_loss'] = g_loss.item()
+        metrics['mr_stft_loss'] = loss_dict.get('recon', 0.0)
+        if use_gan:
+            metrics['fm_loss'] = loss_dict.get('fm', 0.0)
+            metrics['adv_loss'] = loss_dict.get('adv', 0.0)
+        metrics['aux_loss'] = loss_dict.get('aux', 0.0)
+        
         return metrics
 
     @torch.no_grad()
@@ -179,7 +217,6 @@ class FASSMoETrainer:
         for low, high in self.val_loader:
             low, high = low.to(self.device), high.to(self.device)
             fake, _ = self.generator(low)
-            # Only check recon loss for validation
             sc, mag = self.g_criterion.mr_stft(fake, high)
             total_loss += (sc + mag).item()
             count += 1
