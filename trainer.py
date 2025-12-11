@@ -66,16 +66,6 @@ class FASSMoETrainer:
         if self.is_main_process:
             self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
             self.samples_dir.mkdir(parents=True, exist_ok=True)
-            if self.enable_logging and HAS_SWANLAB:
-                try:
-                    swanlab.init(
-                        project="FASS-MoE-SSR",
-                        config=config.__dict__ if hasattr(config, '__dict__') else str(config),
-                        mode="cloud" # or "local"
-                    )
-                    print("🚀 SwanLab initialized.")
-                except Exception as e:
-                    print(f"⚠️ SwanLab init failed: {e}")
         
         self.generator = self.generator.to(self.device)
         self.discriminator = self.discriminator.to(self.device)
