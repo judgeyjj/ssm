@@ -43,30 +43,42 @@ def create_single_sample_dataset(root_dir: Path, length: int = 48000):
 
 class SingleSampleDataset(Dataset):
     """Dataset that returns the SAME sample every time."""
-    def __init__(self, path, config):
+    def __init__(self, path, config, scale_factor=1):
         self.path = path
         self.config = config
+        self.scale_factor = scale_factor
+        
         # Load once
         self.hr, _ = torchaudio.load(str(path))
         
-        # Create LR manually (Blind SR simulation)
-        from dataset import LowPassFilter
-        self.lpf = LowPassFilter(8000, 48000)
-        self.resampler = torchaudio.transforms.Resample(
-            48000, 16000, resampling_method="sinc_interp_kaiser"
-        )
-        
-        # Create LR
-        self.lr = self.resampler(self.lpf(self.hr))
+        # Create LR based on scale_factor
+        if scale_factor > 1:
+            # Traditional SR: downsample
+            from dataset import LowPassFilter
+            lpf = LowPassFilter(config.audio.input_sr // 2, config.audio.target_sr)
+            resampler = torchaudio.transforms.Resample(
+                config.audio.target_sr, config.audio.input_sr, 
+                resampling_method="sinc_interp_kaiser"
+            )
+            self.lr = resampler(lpf(self.hr))
+        else:
+            # Bandwidth extension: same SR, just lowpass
+            from dataset import LowPassFilter
+            # Pick a random effective SR for test (e.g., 8kHz bandwidth)
+            effective_sr = 8000
+            lpf = LowPassFilter(effective_sr // 2, config.audio.target_sr)
+            down = torchaudio.transforms.Resample(config.audio.target_sr, effective_sr)
+            up = torchaudio.transforms.Resample(effective_sr, config.audio.target_sr)
+            self.lr = up(down(lpf(self.hr)))
         
         # Crop to exact training size
         seg_len = config.audio.segment_length
-        lr_len = seg_len // 3  # Assuming 3x upsampling for this test
+        lr_len = seg_len // max(scale_factor, 1)
         
         self.hr = self.hr[:, :seg_len]
         self.lr = self.lr[:, :lr_len]
         
-        # Dummy band_id (assuming standard single band or band 0)
+        # Dummy band_id
         self.band_id = torch.tensor(0, dtype=torch.long)
         
     def __len__(self):
@@ -113,6 +125,11 @@ def train_overfit():
     # 3. Training Loop
     generator.train()
     
+    # Check if generator accepts band_id (do this once, not in loop)
+    import inspect
+    sig = inspect.signature(generator.forward)
+    use_band_id = 'band_id' in sig.parameters
+    
     try:
         for epoch in range(1, 21): # 20 Epochs
             total_loss = 0
@@ -125,10 +142,7 @@ def train_overfit():
                 
                 optimizer.zero_grad()
                 
-                # Check if generator accepts band_id
-                import inspect
-                sig = inspect.signature(generator.forward)
-                if 'band_id' in sig.parameters:
+                if use_band_id:
                     fake, _ = generator(lr, band_id=band_id)
                 else:
                     fake, _ = generator(lr)
