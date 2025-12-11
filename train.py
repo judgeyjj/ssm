@@ -8,12 +8,22 @@ Usage:
 import argparse
 import sys
 from pathlib import Path
+import os
 
 import torch
+import torch.distributed as dist
+from dataclasses import asdict
 
 from config import FASSMoEConfig, get_default_config
 from dataset import create_dataloaders
 from trainer import create_trainer
+
+try:
+    import swanlab
+    _SWANLAB_AVAILABLE = True
+except ImportError:
+    swanlab = None  # type: ignore
+    _SWANLAB_AVAILABLE = False
 
 
 def main():
@@ -23,6 +33,17 @@ def main():
         type=str, 
         default="config.yaml", 
         help="Path to YAML configuration file"
+    )
+    parser.add_argument(
+        "--distributed",
+        action="store_true",
+        help="Use DistributedDataParallel for multi-GPU training",
+    )
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=-1,
+        help="Local rank for distributed training (used with torchrun)",
     )
     args = parser.parse_args()
     
@@ -35,16 +56,55 @@ def main():
         print(f"Warning: Config file {config_path} not found. Using defaults.")
         config = get_default_config()
         
-    # Check device
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    # Distributed setup
+    distributed = False
+    rank = 0
+    world_size = 1
+    local_rank = 0
+
+    if args.distributed:
+        distributed = True
+        if "RANK" in os.environ and "WORLD_SIZE" in os.environ:
+            rank = int(os.environ["RANK"])
+            world_size = int(os.environ["WORLD_SIZE"])
+            local_rank = int(os.environ.get("LOCAL_RANK", 0))
+        else:
+            rank = 0
+            world_size = torch.cuda.device_count() if torch.cuda.is_available() else 1
+            local_rank = args.local_rank if args.local_rank >= 0 else 0
+
+        if torch.cuda.is_available():
+            torch.cuda.set_device(local_rank)
+            backend = "nccl" if dist.is_nccl_available() else "gloo"
+        else:
+            backend = "gloo"
+
+        dist.init_process_group(backend=backend, init_method="env://", world_size=world_size, rank=rank)
+        device = f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu"
+        if rank == 0:
+            print(f"Initialized distributed training: world_size={world_size}, rank={rank}, local_rank={local_rank}, backend={backend}")
+    else:
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+
     print(f"Using device: {device}")
-    if device == "cuda":
+    if device.startswith("cuda") and torch.cuda.is_available():
         print(f"GPU: {torch.cuda.get_device_name(0)}")
+
+    if _SWANLAB_AVAILABLE and (not distributed or rank == 0):
+        try:
+            swanlab.init(project="FASS-MoE-SSR", config=asdict(config))
+        except Exception:
+            pass
         
     # 2. Prepare Data
     print("\n[Data Preparation]")
     try:
-        train_loader, val_loader = create_dataloaders(config)
+        train_loader, val_loader = create_dataloaders(
+            config,
+            distributed=distributed,
+            rank=rank,
+            world_size=world_size,
+        )
     except Exception as e:
         print(f"Error creating dataloaders: {e}")
         print("Please check your data paths in config.yaml")
@@ -61,7 +121,9 @@ def main():
         train_loader=train_loader,
         val_loader=val_loader,
         device=device,
-        checkpoint_dir=config.data.checkpoint_dir
+        checkpoint_dir=config.data.checkpoint_dir,
+        distributed=distributed,
+        local_rank=local_rank,
     )
     
     # 4. Start Training
@@ -77,6 +139,9 @@ def main():
         import traceback
         traceback.print_exc()
         sys.exit(1)
+    finally:
+        if distributed and dist.is_initialized():
+            dist.destroy_process_group()
 
 
 if __name__ == "__main__":

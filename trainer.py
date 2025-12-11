@@ -7,16 +7,27 @@ Handles adversarial training with generator and discriminator.
 from pathlib import Path
 from typing import Dict, Optional
 
+import math
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from tqdm import tqdm
 
 from config import FASSMoEConfig
 from discriminator import ProjectedDiscriminator, build_discriminator
 from generator import FASSMoEGenerator, build_generator
 from losses import MultiResolutionSTFTLoss, FeatureMatchingLoss, HingeLoss
+
+try:
+    import swanlab
+    _SWANLAB_AVAILABLE = True
+except ImportError:
+    swanlab = None  # type: ignore
+    _SWANLAB_AVAILABLE = False
 
 
 class FASSMoETrainer:
@@ -41,6 +52,8 @@ class FASSMoETrainer:
         val_loader: Optional[DataLoader] = None,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
         checkpoint_dir: str = "checkpoints",
+        distributed: bool = False,
+        local_rank: int = 0,
     ):
         self.config = config
         self.generator = generator
@@ -50,10 +63,22 @@ class FASSMoETrainer:
         self.device = device
         self.checkpoint_dir = Path(checkpoint_dir)
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        self.distributed = distributed
+        self.local_rank = local_rank
+        self.grad_accum_steps = max(1, getattr(self.config.training, "grad_accum_steps", 1))
         
         # Move models to device
         self.generator = self.generator.to(self.device)
         self.discriminator = self.discriminator.to(self.device)
+        
+        # Distributed training flags
+        self.train_sampler = getattr(self.train_loader, "sampler", None)
+        if self.distributed and dist.is_available() and dist.is_initialized():
+            # In DDP, global rank is from dist.get_rank(); main process is rank 0
+            self.is_main_process = (dist.get_rank() == 0)
+        else:
+            self.distributed = False
+            self.is_main_process = True
         
         # Optimizers (AdamW)
         # Weight decay defaulting to 0.01 if not specified, though config doesn't have it currently
@@ -95,8 +120,9 @@ class FASSMoETrainer:
     def _setup_schedulers(self):
         """Setup learning rate schedulers with warmup."""
         steps_per_epoch = len(self.train_loader)
-        warmup_steps = self.config.training.warmup_epochs * steps_per_epoch
-        total_steps = self.config.training.num_epochs * steps_per_epoch
+        effective_steps_per_epoch = max(1, math.ceil(steps_per_epoch / max(1, self.grad_accum_steps)))
+        warmup_steps = self.config.training.warmup_epochs * effective_steps_per_epoch
+        total_steps = self.config.training.num_epochs * effective_steps_per_epoch
         
         warmup_g = LinearLR(self.optimizer_g, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
         warmup_d = LinearLR(self.optimizer_d, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
@@ -112,51 +138,80 @@ class FASSMoETrainer:
     
     def train(self) -> None:
         """Run the full training loop."""
-        print(f"Starting training for {self.config.training.num_epochs} epochs")
-        print(f"Device: {self.device}")
+        if self.is_main_process:
+            print(f"Starting training for {self.config.training.num_epochs} epochs")
+            print(f"Device: {self.device}")
         
         for epoch in range(self.current_epoch, self.config.training.num_epochs):
             self.current_epoch = epoch
             train_metrics = self.train_epoch(epoch)
-            self._log_metrics(train_metrics, "train", epoch)
+            if self.is_main_process:
+                self._log_metrics(train_metrics, "train", epoch)
             
             if self.val_loader is not None and (epoch + 1) % self.config.training.val_interval == 0:
                 val_metrics = self.validate()
-                self._log_metrics(val_metrics, "val", epoch)
-                
-                if val_metrics['total_loss'] < self.best_val_loss:
-                    self.best_val_loss = val_metrics['total_loss']
-                    self.save_checkpoint(self.checkpoint_dir / "best_model.pt")
+                if self.is_main_process:
+                    self._log_metrics(val_metrics, "val", epoch)
+                    if val_metrics['total_loss'] < self.best_val_loss:
+                        self.best_val_loss = val_metrics['total_loss']
+                        self.save_checkpoint(self.checkpoint_dir / "best_model.pt")
             
-            if (epoch + 1) % self.config.training.checkpoint_interval == 0:
+            if self.is_main_process and (epoch + 1) % self.config.training.checkpoint_interval == 0:
                 self.save_checkpoint(self.checkpoint_dir / f"checkpoint_epoch_{epoch+1}.pt")
         
-        print("Training complete!")
+        if self.is_main_process:
+            print("Training complete!")
     
     def train_epoch(self, epoch: int) -> Dict[str, float]:
         """Train for one epoch."""
         self.generator.train()
         self.discriminator.train()
         
+        if isinstance(self.train_loader.sampler, DistributedSampler):
+            self.train_loader.sampler.set_epoch(epoch)
+        
         epoch_metrics = {'g_loss': 0.0, 'd_loss': 0.0, 'mr_stft_loss': 0.0, 'fm_loss': 0.0, 'adv_loss': 0.0, 'aux_loss': 0.0}
         num_batches = 0
+        accum_steps = max(1, self.grad_accum_steps)
+
+        self.optimizer_g.zero_grad()
+        self.optimizer_d.zero_grad()
         
-        for batch_idx, (low_res, high_res) in enumerate(self.train_loader):
+        if self.is_main_process:
+            iterator = tqdm(
+                enumerate(self.train_loader),
+                total=len(self.train_loader),
+                desc=f"Train {epoch + 1}",
+            )
+        else:
+            iterator = enumerate(self.train_loader)
+
+        for batch_idx, (low_res, high_res, band_id) in iterator:
             low_res = low_res.to(self.device)
             high_res = high_res.to(self.device)
+            band_id = band_id.to(self.device)
             
-            step_metrics = self.train_step(low_res, high_res)
+            step_metrics = self.train_step(low_res, high_res, band_id, accum_steps)
             
             for key in epoch_metrics:
                 if key in step_metrics:
                     epoch_metrics[key] += step_metrics[key]
             num_batches += 1
+
+            is_update_step = ((batch_idx + 1) % accum_steps == 0) or (batch_idx + 1 == len(self.train_loader))
+
+            if is_update_step:
+                torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.config.training.grad_clip)
+                torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.config.training.grad_clip)
+                self.optimizer_d.step()
+                self.optimizer_g.step()
+                self.optimizer_d.zero_grad()
+                self.optimizer_g.zero_grad()
+                self.scheduler_g.step()
+                self.scheduler_d.step()
+                self.global_step += 1
             
-            self.scheduler_g.step()
-            self.scheduler_d.step()
-            self.global_step += 1
-            
-            if (batch_idx + 1) % self.config.training.log_interval == 0:
+            if (batch_idx + 1) % self.config.training.log_interval == 0 and self.is_main_process:
                 print(f"Epoch {epoch+1} [{batch_idx+1}/{len(self.train_loader)}] G: {step_metrics['g_loss']:.4f} D: {step_metrics['d_loss']:.4f}")
             
         for key in epoch_metrics:
@@ -164,30 +219,25 @@ class FASSMoETrainer:
         
         return epoch_metrics
     
-    def train_step(self, low_res: torch.Tensor, high_res: torch.Tensor) -> Dict[str, float]:
-        """Single training step for both G and D."""
+    def train_step(self, low_res: torch.Tensor, high_res: torch.Tensor, band_id: torch.Tensor, accum_steps: int) -> Dict[str, float]:
+        """Single training step for both G and D with optional gradient accumulation."""
         metrics = {}
         
-        # Discriminator step
-        self.optimizer_d.zero_grad()
-        
+        # Discriminator forward/backward (no optimizer step here)
         with torch.no_grad():
-            fake_high_res, _ = self.generator(low_res)
+            fake_high_res, _ = self.generator(low_res, band_id=band_id)
         
         real_logits, real_features = self.discriminator(high_res)
         fake_logits, _ = self.discriminator(fake_high_res)
         
-        d_loss = self.hinge_loss.discriminator_loss(real_logits, fake_logits)
+        d_loss_full = self.hinge_loss.discriminator_loss(real_logits, fake_logits)
+        d_loss = d_loss_full / max(1, accum_steps)
         d_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.discriminator.parameters(), self.config.training.grad_clip)
-        self.optimizer_d.step()
         
-        metrics['d_loss'] = d_loss.item()
+        metrics['d_loss'] = d_loss_full.item()
         
-        # Generator step
-        self.optimizer_g.zero_grad()
-        
-        fake_high_res, aux_loss = self.generator(low_res)
+        # Generator forward/backward (no optimizer step here)
+        fake_high_res, aux_loss = self.generator(low_res, band_id=band_id)
         fake_logits, fake_features = self.discriminator(fake_high_res)
         _, real_features = self.discriminator(high_res)
         
@@ -196,18 +246,17 @@ class FASSMoETrainer:
         fm_loss = self.feature_matching_loss(real_features, fake_features)
         adv_loss = self.hinge_loss.generator_loss(fake_logits)
         
-        g_loss = (
+        g_loss_full = (
             self.lambda_recon * mr_stft_loss
             + self.lambda_fm * fm_loss
             + self.lambda_adv * adv_loss
             + self.lambda_aux * aux_loss
         )
         
+        g_loss = g_loss_full / max(1, accum_steps)
         g_loss.backward()
-        torch.nn.utils.clip_grad_norm_(self.generator.parameters(), self.config.training.grad_clip)
-        self.optimizer_g.step()
         
-        metrics['g_loss'] = g_loss.item()
+        metrics['g_loss'] = g_loss_full.item()
         metrics['mr_stft_loss'] = mr_stft_loss.item()
         metrics['fm_loss'] = fm_loss.item()
         metrics['adv_loss'] = adv_loss.item()
@@ -224,11 +273,21 @@ class FASSMoETrainer:
         val_metrics = {'total_loss': 0.0, 'mr_stft_loss': 0.0, 'snr': 0.0}
         num_batches = 0
         
-        for low_res, high_res in self.val_loader:
+        if self.is_main_process:
+            iterator = tqdm(
+                self.val_loader,
+                total=len(self.val_loader),
+                desc="Val",
+            )
+        else:
+            iterator = self.val_loader
+
+        for low_res, high_res, band_id in iterator:
             low_res = low_res.to(self.device)
             high_res = high_res.to(self.device)
+            band_id = band_id.to(self.device)
             
-            fake_high_res, _ = self.generator(low_res)
+            fake_high_res, _ = self.generator(low_res, band_id=band_id)
             
             sc_loss, mag_loss = self.mr_stft_loss(fake_high_res, high_res)
             mr_stft_loss = sc_loss + mag_loss
@@ -255,9 +314,17 @@ class FASSMoETrainer:
         """Log metrics to console."""
         metric_str = " | ".join([f"{k}: {v:.4f}" for k, v in metrics.items()])
         print(f"[{prefix.upper()}] Epoch {epoch + 1}: {metric_str}")
+        if _SWANLAB_AVAILABLE and self.is_main_process:
+            try:
+                log_data = {f"{prefix}/{k}": v for k, v in metrics.items()}
+                swanlab.log(log_data, step=self.global_step)
+            except Exception:
+                pass
     
     def save_checkpoint(self, path: Path) -> None:
         """Save model checkpoint."""
+        if not getattr(self, "is_main_process", True):
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         
         checkpoint = {
@@ -300,6 +367,8 @@ def create_trainer(
     val_loader: Optional[DataLoader] = None,
     device: str = "cuda" if torch.cuda.is_available() else "cpu",
     checkpoint_dir: str = "checkpoints",
+    distributed: bool = False,
+    local_rank: int = 0,
 ) -> FASSMoETrainer:
     """Create a trainer with generator and discriminator."""
     generator = build_generator(config)
@@ -313,4 +382,6 @@ def create_trainer(
         val_loader=val_loader,
         device=device,
         checkpoint_dir=checkpoint_dir,
+        distributed=distributed,
+        local_rank=local_rank,
     )

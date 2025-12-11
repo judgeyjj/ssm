@@ -262,10 +262,11 @@ class FASSMoEGenerator(nn.Module):
     使用 RMSNorm 和 Weight Normalization，保证 streaming 和 forward 完全一致。
     """
     
-    def __init__(self, config: ModelConfig, scale_factor: int = 3):
+    def __init__(self, config: ModelConfig, scale_factor: int = 3, num_bands: int = 1):
         super().__init__()
         self.config = config
         self.scale_factor = scale_factor
+        self.num_bands = num_bands
         
         self.stem = Stem(config.hidden_channels, config.kernel_size)
         self.body = MoEBody(config, config.num_moe_layers)
@@ -277,6 +278,11 @@ class FASSMoEGenerator(nn.Module):
         )
         self.refiner = Refiner(config.hidden_channels, config.kernel_size)
         
+        if self.num_bands > 1:
+            self.band_embed = nn.Embedding(self.num_bands, config.hidden_channels)
+        else:
+            self.band_embed = None
+        
         self.input_upsample = nn.Upsample(
             scale_factor=self.scale_factor,
             mode='linear',
@@ -285,10 +291,15 @@ class FASSMoEGenerator(nn.Module):
         self.skip_weight = nn.Parameter(torch.tensor(-2.0))
         self.tanh = nn.Tanh()
     
-    def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, x: torch.Tensor, band_id: Optional[torch.Tensor] = None) -> Tuple[torch.Tensor, torch.Tensor]:
         input_upsampled = self.input_upsample(x)
         
         h = self.stem(x)
+        if self.band_embed is not None and band_id is not None:
+            if band_id.dim() == 2:
+                band_id = band_id.squeeze(-1)
+            band_emb = self.band_embed(band_id.long())
+            h = h + band_emb.unsqueeze(-1)
         h = h.transpose(1, 2)
         h, aux_loss = self.body(h)
         h = h.transpose(1, 2)
@@ -300,14 +311,15 @@ class FASSMoEGenerator(nn.Module):
         
         return output, aux_loss
     
-    def infer(self, x: torch.Tensor) -> torch.Tensor:
-        output, _ = self.forward(x)
+    def infer(self, x: torch.Tensor, band_id: Optional[torch.Tensor] = None) -> torch.Tensor:
+        output, _ = self.forward(x, band_id=band_id)
         return output
     
     def infer_stream(
         self,
         chunk: torch.Tensor,
         state: Optional[Dict] = None,
+        band_id: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Dict]:
         """
         Streaming inference with COMPLETE state management.
@@ -320,6 +332,13 @@ class FASSMoEGenerator(nn.Module):
         input_upsampled = self.input_upsample(chunk)
         
         h, stem_buf = self.stem.forward_with_buffer(chunk, state.get('stem', None))
+        if self.band_embed is not None and band_id is not None:
+            if band_id.dim() == 0:
+                band_id = band_id.view(1)
+            band_emb = self.band_embed(band_id.long())
+            if band_emb.dim() == 2:
+                band_emb = band_emb.unsqueeze(-1)
+            h = h + band_emb
         
         h = h.transpose(1, 2)
         h, body_states, _ = self.body.forward_with_state(h, state.get('body', None))
@@ -351,8 +370,9 @@ def build_generator(config: FASSMoEConfig) -> FASSMoEGenerator:
             f"of input sample rate ({config.audio.input_sr})"
         )
     scale_factor = config.audio.target_sr // config.audio.input_sr
+    num_bands = len(getattr(config.audio, "effective_srs", [config.audio.target_sr]))
 
-    model = FASSMoEGenerator(config.model, scale_factor=scale_factor)
+    model = FASSMoEGenerator(config.model, scale_factor=scale_factor, num_bands=num_bands)
     _init_weights(model)
     return model
 

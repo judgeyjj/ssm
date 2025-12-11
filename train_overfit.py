@@ -49,30 +49,31 @@ class SingleSampleDataset(Dataset):
         self.config = config
         # Load once
         self.hr, _ = torchaudio.load(str(path))
-        
-        # Create LR manually
-        from dataset import LowPassFilter
-        self.lpf = LowPassFilter(8000, 48000)
-        self.resampler = torchaudio.transforms.Resample(
-            48000, 16000, resampling_method="sinc_interp_kaiser"
-        )
-        
-        # Create LR
-        self.lr = self.resampler(self.lpf(self.hr))
-        
-        # Crop to exact training size
-        # Ensure we crop a valid region
+
+        # For sanity overfit: let LR == HR (identity mapping at 48k)
+        self.lr = self.hr.clone()
+
+        # Crop / pad to exact training size so that LR and HR have same length
         seg_len = config.audio.segment_length
-        lr_len = seg_len // 3
+
+        def _crop_or_pad(x):
+            cur_len = x.shape[-1]
+            if cur_len < seg_len:
+                pad = seg_len - cur_len
+                return torch.nn.functional.pad(x, (0, pad), mode="constant", value=0.0)
+            return x[:, :seg_len]
+
+        self.hr = _crop_or_pad(self.hr)
+        self.lr = _crop_or_pad(self.lr)
         
-        self.hr = self.hr[:, :seg_len]
-        self.lr = self.lr[:, :lr_len]
+        # Only one band for identity overfit
+        self.band_id = 0
         
     def __len__(self):
         return 100  # Pretend we have 100 samples per epoch
     
     def __getitem__(self, idx):
-        return self.lr, self.hr
+        return self.lr, self.hr, self.band_id
 
 def train_overfit():
     print("\n" + "=" * 60)
@@ -84,6 +85,11 @@ def train_overfit():
     
     # 1. Setup Config & Data
     config = get_default_config()
+    # For overfit sanity check: force 48k->48k identity setting
+    config.audio.input_sr = 48000
+    config.audio.target_sr = 48000
+    # Only one effective band so band_id is always 0
+    config.audio.effective_srs = [48000]
     # Use small model for fast iteration check
     config.model.hidden_channels = 32 
     config.model.num_moe_layers = 4
@@ -111,12 +117,12 @@ def train_overfit():
             total_loss = 0
             steps = 0
             
-            for lr, hr in dataloader:
-                lr, hr = lr.to(device), hr.to(device)
+            for lr, hr, band_id in dataloader:
+                lr, hr, band_id = lr.to(device), hr.to(device), band_id.to(device)
                 
                 optimizer.zero_grad()
                 
-                fake, _ = generator(lr)
+                fake, _ = generator(lr, band_id=band_id)
                 
                 # Compute only Reconstruction Loss
                 sc_loss, mag_loss = criterion(fake, hr)

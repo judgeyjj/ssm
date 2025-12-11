@@ -18,7 +18,7 @@ from pathlib import Path
 @dataclass
 class AudioConfig:
     """Audio processing configuration."""
-    input_sr: int = 16000
+    input_sr: int = 48000
     target_sr: int = 48000
     # Important: segment_length must be divisible by (target_sr / input_sr)
     segment_length: int = 16200 
@@ -28,6 +28,7 @@ class AudioConfig:
     mel_channels: int = 80
     fmin: float = 0.0
     fmax: float = 8000.0
+    effective_srs: List[int] = field(default_factory=lambda: [8000, 16000, 24000, 32000, 48000])
 
 
 @dataclass
@@ -57,6 +58,7 @@ class DiscriminatorConfig:
 class TrainingConfig:
     """Training hyperparameters."""
     batch_size: int = 16
+    grad_accum_steps: int = 1
     learning_rate_g: float = 2e-4
     learning_rate_d: float = 2e-4
     betas: Tuple[float, float] = (0.8, 0.99)

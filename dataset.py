@@ -11,6 +11,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torchaudio
 from torch.utils.data import Dataset, DataLoader
+from torch.utils.data.distributed import DistributedSampler
 
 from config import AudioConfig, FASSMoEConfig
 
@@ -140,29 +141,13 @@ class SSRDataset(Dataset):
         if len(self.audio_paths) == 0:
             raise ValueError("No valid audio files found in the provided paths.")
         
-        # Low-pass filter at 8kHz (Nyquist frequency for 16kHz target)
-        # Applied before downsampling to prevent aliasing
-        self.lowpass_filter = LowPassFilter(
-            cutoff_freq=8000,  # 8kHz cutoff
-            sample_rate=config.target_sr,
-            kernel_size=101,
-        )
-        
-        # High-quality Sinc resampler for downsampling
-        # Using kaiser_best for highest quality interpolation
-        self.resampler = torchaudio.transforms.Resample(
-            orig_freq=config.target_sr,
-            new_freq=config.input_sr,
-            resampling_method="sinc_interp_kaiser",
-            lowpass_filter_width=64,
-            rolloff=0.9475937167399596,
-            dtype=torch.float32,
-        )
+        # Effective sample rates (define different bandlimits), e.g. [8k,16k,24k,32k,48k]
+        self.effective_srs = getattr(config, "effective_srs", [8000, 16000, 24000, 32000, 48000])
     
     def __len__(self) -> int:
         return len(self.audio_paths)
     
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, int]:
         """
         Load high-res audio and create low-res version via degradation.
         
@@ -194,13 +179,13 @@ class SSRDataset(Dataset):
         high_res_audio = self._crop_segment(high_res_audio)
         
         # Create degraded low-resolution version
-        low_res_audio = self._create_low_res(high_res_audio)
+        low_res_audio, band_id = self._create_low_res(high_res_audio)
         
         # Normalize both to [-1, 1]
         high_res_audio = self._normalize(high_res_audio)
         low_res_audio = self._normalize(low_res_audio)
         
-        return low_res_audio, high_res_audio
+        return low_res_audio, high_res_audio, band_id
     
     def _load_audio(self, path: Path) -> Tuple[torch.Tensor, int]:
         """
@@ -275,28 +260,67 @@ class SSRDataset(Dataset):
         
         return audio
     
-    def _create_low_res(self, high_res: torch.Tensor) -> torch.Tensor:
+    def _create_low_res(self, high_res: torch.Tensor) -> Tuple[torch.Tensor, int]:
         """
-        Create degraded low-resolution audio from high-resolution input.
+        Create degraded band-limited audio from high-resolution 48kHz input.
         
-        Pipeline:
-        1. Apply low-pass filter at 8kHz (anti-aliasing)
-        2. Downsample from 48kHz to 16kHz using sinc interpolation
+        Pipeline (48k -> band-limited 48k):
+        1. Randomly pick an effective sample rate sr_eff from self.effective_srs
+        2. Apply low-pass filter at cutoff = sr_eff / 2
+        3. Optionally downsample to sr_eff then upsample back to 48k to simulate real resampling artifacts
         
         Args:
             high_res: High-resolution audio tensor of shape (1, segment_length).
             
         Returns:
-            Low-resolution audio of shape (1, input_segment_length).
+            Band-limited audio of shape (1, segment_length) at 48kHz.
         """
-        # Step 1: Apply low-pass filter at 8kHz cutoff
-        # This removes frequencies above Nyquist for 16kHz to prevent aliasing
-        filtered = self.lowpass_filter(high_res)
-        
-        # Step 2: Downsample to 16kHz using high-quality sinc interpolation
-        low_res = self.resampler(filtered)
-        
-        return low_res
+        # Pick effective sample rate (defines Nyquist / effective bandwidth)
+        if isinstance(self.effective_srs, list):
+            effective_srs = self.effective_srs
+        else:
+            effective_srs = list(self.effective_srs)
+
+        if len(effective_srs) == 0:
+            effective_srs = [8000, 16000, 24000, 32000, 48000]
+
+        idx = torch.randint(0, len(effective_srs), (1,)).item()
+        sr_eff = int(effective_srs[idx])
+
+        # Step 1: low-pass at sr_eff / 2 on 48k audio
+        cutoff = sr_eff / 2.0
+        lpf = LowPassFilter(
+            cutoff_freq=cutoff,
+            sample_rate=self.config.target_sr,
+            kernel_size=101,
+        )
+        filtered = lpf(high_res)
+
+        # Step 2: simulate real resampling pipeline: 48k -> sr_eff -> 48k
+        if sr_eff < self.config.target_sr:
+            down = torchaudio.transforms.Resample(
+                orig_freq=self.config.target_sr,
+                new_freq=sr_eff,
+                resampling_method="sinc_interp_kaiser",
+            )(filtered)
+            band_limited = torchaudio.transforms.Resample(
+                orig_freq=sr_eff,
+                new_freq=self.config.target_sr,
+                resampling_method="sinc_interp_kaiser",
+            )(down)
+        else:
+            band_limited = filtered
+
+        # Match length with high_res exactly (crop or pad)
+        target_len = high_res.shape[-1]
+        cur_len = band_limited.shape[-1]
+        if cur_len < target_len:
+            pad = target_len - cur_len
+            band_limited = torch.nn.functional.pad(band_limited, (0, pad), mode="constant", value=0.0)
+        elif cur_len > target_len:
+            band_limited = band_limited[:, :target_len]
+
+        return band_limited, idx
     
     def _normalize(self, audio: torch.Tensor) -> torch.Tensor:
         """
@@ -350,6 +374,9 @@ def create_dataloader(
     data_dir: Optional[str] = None,
     audio_paths: Optional[List[Union[str, Path]]] = None,
     train: bool = True,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> DataLoader:
     """
     Create a DataLoader for the SSR dataset.
@@ -374,11 +401,23 @@ def create_dataloader(
         config=config.audio,
         train=train,
     )
+
+    if distributed:
+        sampler = DistributedSampler(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=train,
+            drop_last=train,
+        )
+    else:
+        sampler = None
     
     dataloader = DataLoader(
         dataset,
         batch_size=config.training.batch_size,
-        shuffle=train,
+        shuffle=(sampler is None and train),
+        sampler=sampler,
         num_workers=config.training.num_workers,
         pin_memory=True,
         drop_last=train,
@@ -387,7 +426,12 @@ def create_dataloader(
     return dataloader
 
 
-def create_dataloaders(config: FASSMoEConfig) -> Tuple[DataLoader, DataLoader]:
+def create_dataloaders(
+    config: FASSMoEConfig,
+    distributed: bool = False,
+    rank: int = 0,
+    world_size: int = 1,
+) -> Tuple[DataLoader, DataLoader]:
     """
     Create train and validation DataLoaders using paths from config.
     
@@ -399,16 +443,21 @@ def create_dataloaders(config: FASSMoEConfig) -> Tuple[DataLoader, DataLoader]:
     """
     print(f"Loading training data from: {config.data.train_dir}")
     train_loader = create_dataloader(
-        config, 
-        data_dir=config.data.train_dir, 
-        train=True
+        config,
+        data_dir=config.data.train_dir,
+        train=True,
+        distributed=distributed,
+        rank=rank,
+        world_size=world_size,
     )
     
     print(f"Loading validation data from: {config.data.val_dir}")
+    # For simplicity, run validation on full dataset on each rank
     val_loader = create_dataloader(
-        config, 
-        data_dir=config.data.val_dir, 
-        train=False
+        config,
+        data_dir=config.data.val_dir,
+        train=False,
+        distributed=False,
     )
     
     return train_loader, val_loader

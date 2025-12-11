@@ -1,10 +1,11 @@
 audio:
-  input_sr: 16000
+  input_sr: 48000
   target_sr: 48000
   segment_length: 16200
   n_fft: 1024
   hop_length: 256
   mel_channels: 80
+  effective_srs: [8000, 16000, 24000, 32000, 48000]
 
 model:
   hidden_channels: 96
@@ -20,7 +21,8 @@ discriminator:
   pretrained: true
 
 training:
-  batch_size: 16
+  batch_size: 4
+  grad_accum_steps: 4
   learning_rate_g: 0.0002
   learning_rate_d: 0.0002
   num_epochs: 200
