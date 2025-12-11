@@ -1,6 +1,7 @@
 """
 Training loop for FASS-MoE Speech Super-Resolution (SOTA HiFi-GAN style).
-Supports Generator Warmup, DistributedDataParallel, Tqdm, SwanLab logging, and BF16 AMP.
+Supports Generator Warmup, DistributedDataParallel, Tqdm, and SwanLab logging.
+Note: TF32 is enabled by default on Ampere GPUs (A40) for automatic speedup.
 """
 
 import os
@@ -44,7 +45,6 @@ class FASSMoETrainer:
         distributed: bool = False,
         local_rank: int = 0,
         enable_logging: bool = True,
-        use_amp: bool = True,  # Enable BF16 mixed precision by default
     ):
         self.config = config
         self.generator = generator
@@ -103,11 +103,13 @@ class FASSMoETrainer:
         self.global_step = 0
         self.best_val_loss = float('inf')
         
-        # AMP setup (BF16 for Ampere GPUs like A40)
-        self.use_amp = use_amp and torch.cuda.is_available()
-        self.amp_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-        if self.is_main_process and self.use_amp:
-            print(f"🚀 AMP enabled with dtype: {self.amp_dtype}")
+        # TF32 is enabled by default on Ampere GPUs (A40)
+        # No explicit code needed - provides ~2x speedup automatically
+        if torch.cuda.is_available():
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            if self.is_main_process:
+                print("🚀 TF32 enabled for matmul and cuDNN")
     
     def _setup_schedulers(self):
         steps_per_epoch = len(self.train_loader) // self.grad_accum_steps
@@ -213,19 +215,15 @@ class FASSMoETrainer:
         
         gen_module = self.generator.module if self.distributed else self.generator
         
-        # AMP context for forward passes
-        amp_context = torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=self.use_amp)
-        
         # ===================================================================================
         # 1. Discriminator Step
         # ===================================================================================
         if use_gan:
-            with torch.no_grad(), amp_context:
+            with torch.no_grad():
                 fake_high_res, _ = gen_module(low_res, band_id=band_id)
             
-            with amp_context:
-                y_d_hat_r, y_d_hat_g, _, _ = self.discriminator(high_res, fake_high_res.detach())
-                d_loss = self.adv_loss_fn.discriminator_loss(y_d_hat_r, y_d_hat_g)
+            y_d_hat_r, y_d_hat_g, _, _ = self.discriminator(high_res, fake_high_res.detach())
+            d_loss = self.adv_loss_fn.discriminator_loss(y_d_hat_r, y_d_hat_g)
             
             (d_loss / self.grad_accum_steps).backward()
             
@@ -239,23 +237,22 @@ class FASSMoETrainer:
         # ===================================================================================
         # 2. Generator Step
         # ===================================================================================
-        with amp_context:
-            fake_high_res, aux_loss = gen_module(low_res, band_id=band_id)
+        fake_high_res, aux_loss = gen_module(low_res, band_id=band_id)
+        
+        if use_gan:
+            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.discriminator(high_res, fake_high_res)
             
-            if use_gan:
-                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.discriminator(high_res, fake_high_res)
-                
-                g_loss, loss_dict = self.g_criterion(
-                    fake_high_res, high_res, y_d_hat_g, fmap_r, fmap_g, aux_loss
-                )
-            else:
-                # Warmup: Recon + Aux only
-                sc, mag = self.g_criterion.mr_stft(fake_high_res, high_res)
-                recon_loss = sc + mag
-                g_loss = self.config.training.lambda_mr_stft * recon_loss + \
-                         self.config.training.lambda_aux * aux_loss
-                
-                loss_dict = {'recon': recon_loss.item(), 'aux': aux_loss.item()}
+            g_loss, loss_dict = self.g_criterion(
+                fake_high_res, high_res, y_d_hat_g, fmap_r, fmap_g, aux_loss
+            )
+        else:
+            # Warmup: Recon + Aux only
+            sc, mag = self.g_criterion.mr_stft(fake_high_res, high_res)
+            recon_loss = sc + mag
+            g_loss = self.config.training.lambda_mr_stft * recon_loss + \
+                     self.config.training.lambda_aux * aux_loss
+            
+            loss_dict = {'recon': recon_loss.item(), 'aux': aux_loss.item()}
         
         (g_loss / self.grad_accum_steps).backward()
         
@@ -286,15 +283,12 @@ class FASSMoETrainer:
         else:
             loader = self.val_loader
         
-        amp_context = torch.amp.autocast('cuda', dtype=self.amp_dtype, enabled=self.use_amp)
-        
         for low, high, band_id in loader:
             low, high = low.to(self.device), high.to(self.device)
             band_id = band_id.to(self.device)
             
-            with amp_context:
-                fake, _ = gen_module(low, band_id=band_id)
-                sc, mag = self.g_criterion.mr_stft(fake, high)
+            fake, _ = gen_module(low, band_id=band_id)
+            sc, mag = self.g_criterion.mr_stft(fake, high)
             total_loss += (sc + mag).item()
             count += 1
             
