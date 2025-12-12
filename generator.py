@@ -141,6 +141,7 @@ class MoEBody(nn.Module):
     
     def __init__(self, config: ModelConfig, num_layers: int):
         super().__init__()
+        self.use_checkpointing = getattr(config, "use_checkpointing", False)
         self.layers = nn.ModuleList([
             FASSMoEBlock(config) for _ in range(num_layers)
         ])
@@ -148,7 +149,23 @@ class MoEBody(nn.Module):
     def forward(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         total_aux_loss = 0.0
         for layer in self.layers:
-            x, aux_loss = layer(x)
+            if self.use_checkpointing and self.training:
+                # Gradient Checkpointing
+                # Note: checkpoint requires inputs to have requires_grad=True for backward to work properly
+                # and at least one input must have requires_grad=True.
+                # FASSMoEBlock returns (x, aux_loss). We need to wrap it to return only x for checkpointing
+                # or handle the tuple return carefully if supported (newer pytorch supports it).
+                # However, aux_loss is a scalar usually detached or just a value.
+                # To be safe and simple, we can define a custom forward for checkpointing.
+                
+                def custom_forward(module, input_x):
+                    return module(input_x)
+                
+                # Checkpointing handles tuple returns in recent PyTorch versions
+                x, aux_loss = torch.utils.checkpoint.checkpoint(custom_forward, layer, x, use_reentrant=False)
+            else:
+                x, aux_loss = layer(x)
+            
             total_aux_loss = total_aux_loss + aux_loss
         total_aux_loss = total_aux_loss / len(self.layers)
         return x, total_aux_loss

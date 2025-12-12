@@ -226,12 +226,15 @@ class FASSMoETrainer:
         # 1. Discriminator Step (Only if warmed up)
         # ===================================================================================
         if use_gan:
-            with torch.no_grad():
-                fake_high_res, _ = gen_module(low_res, band_id=band_id)
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+                with torch.no_grad():
+                    fake_high_res, _ = gen_module(low_res, band_id=band_id)
+                
+                y_d_hat_r, y_d_hat_g, _, _ = self.discriminator(high_res, fake_high_res.detach())
+                
+                d_loss = self.d_criterion(y_d_hat_r, y_d_hat_g)
             
-            y_d_hat_r, y_d_hat_g, _, _ = self.discriminator(high_res, fake_high_res.detach())
-            
-            d_loss = self.d_criterion(y_d_hat_r, y_d_hat_g)
+            # Backward for Discriminator
             (d_loss / self.grad_accum_steps).backward()
             
             if update:
@@ -244,23 +247,25 @@ class FASSMoETrainer:
         # ===================================================================================
         # 2. Generator Step
         # ===================================================================================
-        fake_high_res, aux_loss = gen_module(low_res, band_id=band_id)
-        
-        if use_gan:
-            y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.discriminator(high_res, fake_high_res)
+        with torch.cuda.amp.autocast(dtype=torch.bfloat16):
+            fake_high_res, aux_loss = gen_module(low_res, band_id=band_id)
             
-            g_loss, loss_dict = self.g_criterion(
-                fake_high_res, high_res, y_d_hat_g, fmap_r, fmap_g, aux_loss
-            )
-        else:
-            # Warmup: Recon + Aux only
-            sc, mag = self.g_criterion.mr_stft(fake_high_res, high_res)
-            recon_loss = sc + mag
-            g_loss = self.config.training.lambda_mr_stft * recon_loss + \
-                     self.config.training.lambda_aux * aux_loss
-            
-            loss_dict = {'recon': recon_loss.item(), 'aux': aux_loss.item()}
+            if use_gan:
+                y_d_hat_r, y_d_hat_g, fmap_r, fmap_g = self.discriminator(high_res, fake_high_res)
+                
+                g_loss, loss_dict = self.g_criterion(
+                    fake_high_res, high_res, y_d_hat_g, fmap_r, fmap_g, aux_loss
+                )
+            else:
+                # Warmup: Recon + Aux only
+                sc, mag = self.g_criterion.mr_stft(fake_high_res, high_res)
+                recon_loss = sc + mag
+                g_loss = self.config.training.lambda_mr_stft * recon_loss + \
+                         self.config.training.lambda_aux * aux_loss
+                
+                loss_dict = {'recon': recon_loss.item(), 'aux': aux_loss.item()}
         
+        # Backward for Generator
         (g_loss / self.grad_accum_steps).backward()
         
         if update:

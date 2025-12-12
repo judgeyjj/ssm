@@ -191,6 +191,16 @@ class MambaBlock(nn.Module):
             C_in = C_param.transpose(1, 2)              # (B, N, L)
             D_in = self.D                               # (D)
             
+            # Ensure inputs match u.dtype (BF16/FP16), but A and D must be FP32 for the kernel
+            dtype = u.dtype
+            delta = delta.to(dtype)
+            B_in = B_in.to(dtype)
+            C_in = C_in.to(dtype)
+            
+            # A and D must be float32 for numerical stability in the kernel
+            A_in = A_in.float()
+            D_in = D_in.float()
+            
             # Run kernel
             # returns (B, D, L)
             # Note: selective_scan_fn already incorporates D internally when D_in is provided

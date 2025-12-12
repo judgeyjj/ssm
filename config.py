@@ -42,6 +42,7 @@ class ModelConfig:
     mamba_d_state: int = 16
     mamba_d_conv: int = 4
     dropout: float = 0.1
+    use_checkpointing: bool = True
 
 
 @dataclass

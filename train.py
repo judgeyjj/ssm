@@ -17,7 +17,6 @@ from dataclasses import asdict
 from config import FASSMoEConfig, get_default_config
 from dataset import create_dataloaders
 from trainer import create_trainer
-
 try:
     import swanlab
     _SWANLAB_AVAILABLE = True
